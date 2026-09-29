@@ -10,6 +10,8 @@ const state = {
   sites: [],
   activeSeverities: new Set(SEVS),   // legend chips act as filters
   pollTimer: null,
+  lastEventId: 0,       // cursor so each progress toast is shown exactly once
+  primed: false,        // suppress replaying old events on first page load
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -23,24 +25,90 @@ const host = (url) => { try { return new URL(url).host; } catch { return url; } 
 
 /* ------------------------------- Data ------------------------------- */
 async function load() {
-  const res = await fetch("/api/findings");
+  const res = await fetch(`/api/findings?since=${state.lastEventId}`);
   const data = await res.json();
   state.findings = data.findings || [];
   state.sites = data.sites || [];
 
+  // On first load, jump the cursor to the end so a page refresh mid-session
+  // doesn't replay every event as a burst of toasts.
+  if (!state.primed) {
+    state.lastEventId = data.last_event_id || 0;
+    state.primed = true;
+  } else if (data.events && data.events.length) {
+    for (const ev of data.events) showToast(ev.message, ev.level, ev.kind);
+    state.lastEventId = data.events[data.events.length - 1].id;
+  }
+
   renderPosture(data.summary || {});
   renderTargets(state.sites);
   renderSiteFilter(state.sites);
-  renderScanState(data.scanning);
+  renderScanState(data.scanning, data.progress);
   render();
 
-  // Poll while a scan batch is running, then stop.
-  if (data.scanning && !state.pollTimer) {
-    state.pollTimer = setInterval(load, 3000);
-  } else if (!data.scanning && state.pollTimer) {
-    clearInterval(state.pollTimer);
-    state.pollTimer = null;
-  }
+  // Always keep polling, but adapt the rate: fast while a batch runs so
+  // progress toasts land near real time, slow when idle so a scan started
+  // elsewhere (another tab, or a POST to /api/scan) is still picked up.
+  schedulePoll(data.scanning ? 2000 : 6000);
+}
+
+function schedulePoll(delay) {
+  if (state.pollTimer) clearTimeout(state.pollTimer);
+  state.pollTimer = setTimeout(() => {
+    load().catch(() => schedulePoll(6000));   // keep trying after a blip
+  }, delay);
+}
+
+/* ------------------------------ Toasts ------------------------------ */
+/* Scans run server-side on background threads, so progress is pushed to the
+ * UI as events (target changes, API key rotation, batch completion) and shown
+ * here as stacked, auto-dismissing toasts. */
+const TOAST_ICONS = {
+  scan_start: "▶",
+  target_start: "◆",
+  target_done: "✓",
+  key_rotated: "⟳",
+  scan_complete: "■",
+};
+
+function showToast(message, level = "info", kind = "") {
+  const wrap = $("#toasts");
+  if (!wrap) return;
+
+  const t = el("div", `toast toast--${level}`);
+  t.setAttribute("role", level === "error" ? "alert" : "status");
+  // Failures take an icon from the level, not the kind — a failed target is
+  // still a "target_done" event but must never show a checkmark.
+  const icon = TOAST_ICONS[kind] && kind === "key_rotated" ? TOAST_ICONS[kind]
+             : level === "error" ? "✕"
+             : level === "warn" ? "⚠"
+             : TOAST_ICONS[kind] || "•";
+  t.appendChild(el("span", "toast__icon", icon));
+  t.appendChild(el("span", "toast__msg", message));
+
+  const close = el("button", "toast__close", "×");
+  close.setAttribute("aria-label", "Dismiss");
+  close.addEventListener("click", () => dismissToast(t));
+  t.appendChild(close);
+
+  wrap.appendChild(t);
+
+  // Completion messages matter most — keep them up longer.
+  const life = kind === "scan_complete" ? 9000
+             : level === "error" || level === "warn" ? 8000
+             : 4500;
+  t.dataset.timer = String(setTimeout(() => dismissToast(t), life));
+
+  // Cap the stack so a big batch can't fill the screen.
+  const toasts = wrap.querySelectorAll(".toast");
+  if (toasts.length > 5) dismissToast(toasts[0]);
+}
+
+function dismissToast(t) {
+  if (!t || t.classList.contains("toast--out")) return;
+  clearTimeout(Number(t.dataset.timer));
+  t.classList.add("toast--out");
+  setTimeout(() => t.remove(), 220);
 }
 
 /* ----------------------------- Posture ------------------------------ */
@@ -118,12 +186,15 @@ function renderSiteFilter(sites) {
   sel.value = current;
 }
 
-function renderScanState(scanning) {
+function renderScanState(scanning, progress) {
   const badge = $("#scan-state");
   const btn = $("#btn-scan");
   if (scanning) {
     badge.hidden = false;
-    badge.textContent = "Scanning…";
+    const p = progress || {};
+    badge.textContent = p.total
+      ? `Scanning… ${p.done || 0}/${p.total}`
+      : "Scanning…";
     btn.disabled = true;
   } else {
     badge.hidden = true;

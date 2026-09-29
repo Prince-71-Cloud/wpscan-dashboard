@@ -47,12 +47,21 @@ def api_findings():
     for site, st in statuses.items():
         sites.setdefault(site, st)
 
+    # Progress events newer than the client's cursor, so toasts never repeat.
+    try:
+        since = int(request.args.get("since", 0))
+    except (TypeError, ValueError):
+        since = 0
+
     return jsonify({
         "findings": findings,
         "summary": summarize(findings),
         "severities": SEVERITY_ORDER,
         "sites": list(sites.values()),
         "scanning": manager.is_running(),
+        "progress": manager.progress(),
+        "events": manager.events.since(since),
+        "last_event_id": manager.events.latest_id(),
         "wpscan_keys_configured": scanner.build_keyring(CONFIG).count(),
     })
 

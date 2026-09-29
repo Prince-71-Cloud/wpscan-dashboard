@@ -151,6 +151,22 @@ class KeyRing:
         with self._lock:
             return [k for k in self._keys if k in self._exhausted]
 
+    def label(self, key: str | None) -> str:
+        """
+        Human label for UI messages: position in the ring plus a masked
+        fingerprint, e.g. "key #2 of 3 (a1b2…f9e8)". Position matters because
+        two keys can share the same first/last characters.
+        """
+        if not key:
+            return "no key"
+        with self._lock:
+            try:
+                pos = self._keys.index(key) + 1
+            except ValueError:
+                return _mask_key(key)
+            total = len(self._keys)
+        return f"key #{pos} of {total} ({_mask_key(key)})"
+
     def lease(self) -> str | None:
         """
         Claim the next usable key, round-robin. Each caller (i.e. each site scan)
@@ -330,11 +346,65 @@ def read_sites(path: str) -> list[str]:
 # --------------------------------------------------------------------------- #
 # Background batch runner
 # --------------------------------------------------------------------------- #
+def _mask_key(key: str | None) -> str:
+    """Identify a key in UI messages without printing the secret."""
+    if not key:
+        return "no key"
+    if len(key) <= 8:
+        return key[:2] + "…" + key[-2:]
+    return f"{key[:4]}…{key[-4:]}"
+
+
+class EventLog:
+    """
+    Small in-memory ring of scan progress events for the UI to poll.
+
+    Scans run on background threads, so progress (key rotation, moving to the
+    next target, batch completion) is invisible to the browser otherwise. Each
+    event gets a monotonic id; the frontend passes the highest id it has seen
+    and receives only newer ones, which keeps toasts from repeating.
+    """
+
+    def __init__(self, maxlen: int = 200):
+        self._events: list[dict[str, Any]] = []
+        self._next_id = 1
+        self._maxlen = maxlen
+        self._lock = threading.Lock()
+
+    def emit(self, kind: str, message: str, level: str = "info") -> None:
+        import time as _time
+        with self._lock:
+            self._events.append({
+                "id": self._next_id,
+                "kind": kind,          # scan_start | target_start | target_done
+                                       # | key_rotated | scan_complete
+                "level": level,        # info | success | warn | error
+                "message": message,
+                "ts": _time.time(),
+            })
+            self._next_id += 1
+            if len(self._events) > self._maxlen:
+                self._events = self._events[-self._maxlen:]
+
+    def since(self, last_id: int) -> list[dict[str, Any]]:
+        with self._lock:
+            return [e for e in self._events if e["id"] > last_id]
+
+    def latest_id(self) -> int:
+        with self._lock:
+            return self._next_id - 1
+
+    def clear(self) -> None:
+        with self._lock:
+            self._events.clear()
+
+
 class ScanManager:
     """
     Runs a batch of WPScan jobs on a thread pool. One batch at a time; the web
     layer checks `is_running()` before starting another. State lives in the DB,
-    so the dashboard reflects progress by polling /api/findings.
+    so the dashboard reflects progress by polling /api/findings. Progress events
+    (target changes, key rotation, completion) go to `self.events` for the UI.
     """
 
     def __init__(self, db: Database, config: dict[str, Any]):
@@ -343,41 +413,76 @@ class ScanManager:
         self._lock = threading.Lock()
         self._running = False
         self._keyring = KeyRing([])
+        self.events = EventLog()
+        self._done = 0
+        self._total = 0
 
     def is_running(self) -> bool:
         with self._lock:
             return self._running
+
+    def progress(self) -> dict[str, int]:
+        with self._lock:
+            return {"done": self._done, "total": self._total}
 
     def start_batch(self, sites: list[str]) -> bool:
         with self._lock:
             if self._running:
                 return False
             self._running = True
+            self._done = 0
+            self._total = len(sites)
         thread = threading.Thread(target=self._run_batch, args=(sites,), daemon=True)
         thread.start()
         return True
 
     def _run_batch(self, sites: list[str]) -> None:
+        import time
+        started = time.time()
         try:
             # Reload keys each batch so edits to api_keys.txt take effect without
             # restarting the server. Shared across this batch's scan threads.
             self._keyring = build_keyring(self.config)
+            keys = self._keyring.count()
+            self.events.emit(
+                "scan_start",
+                f"Scan started — {len(sites)} target(s), "
+                f"{keys if keys else 'no'} API key(s) in rotation.",
+                level="info",
+            )
             # Pre-create scan rows so the UI shows every site as "running".
             scan_ids = {s: self.db.create_scan(s, status="running") for s in sites}
             workers = max(1, int(self.config.get("MAX_CONCURRENT", 3)))
             with ThreadPoolExecutor(max_workers=workers) as pool:
-                for site in sites:
-                    pool.submit(self._scan_one, site, scan_ids[site])
+                for idx, site in enumerate(sites, 1):
+                    pool.submit(self._scan_one, site, scan_ids[site], idx, len(sites))
         finally:
             with self._lock:
                 self._running = False
+                done = self._done
+            elapsed = int(time.time() - started)
+            statuses = self.db.latest_scan_status()
+            ok = sum(1 for s in sites if statuses.get(s, {}).get("status") == "success")
+            failed = len(sites) - ok
+            total_findings = len(self.db.all_findings())
+            msg = (f"Scan complete — {ok}/{len(sites)} target(s) succeeded"
+                   + (f", {failed} failed" if failed else "")
+                   + f". {total_findings} finding(s) in {elapsed}s.")
+            self.events.emit("scan_complete", msg,
+                             level="warn" if failed else "success")
 
-    def _scan_one(self, site: str, scan_id: int) -> None:
+    def _scan_one(self, site: str, scan_id: int, index: int = 1, total: int = 1) -> None:
         import time
         keyring = self._keyring
         # Claim a key round-robin so each site in the batch uses a different key
         # and the daily quota is spread across every key in the file.
         key = keyring.lease()
+        self.events.emit(
+            "target_start",
+            f"[{index}/{total}] Scanning {site}"
+            + (f" — using {keyring.label(key)}" if key else " — no API key"),
+            level="info",
+        )
         # At least one attempt; up to one attempt per key if keys keep failing.
         attempts = max(1, keyring.count())
         last_limit_err: Exception | None = None
@@ -397,29 +502,60 @@ class ScanManager:
                     wp_version=parsed.get("wp_version"),
                     target_ip=parsed.get("target_ip"),
                 )
+                n = len(parsed["findings"])
+                self.events.emit(
+                    "target_done",
+                    f"[{index}/{total}] {site} done — {n} finding(s).",
+                    level="success",
+                )
+                self._mark_done()
                 # Scan succeeded, but if that used up the key's quota, retire it
                 # now so the next site doesn't waste an attempt discovering it.
                 remaining = _requests_remaining(report)
                 if key and remaining is not None and remaining <= 0:
                     keyring.report_exhausted(key)
+                    self.events.emit(
+                        "key_rotated",
+                        f"API {keyring.label(key)} reached its daily limit and was "
+                        f"retired — {keyring.active_count()} key(s) still usable.",
+                        level="warn",
+                    )
                 return
             except KeyProblem as exc:
                 # Key is spent or rejected — retire it and retry on the next one.
                 last_limit_err = exc
                 if not key:
                     break  # no keys configured at all; nothing to rotate to
+                spent = key
                 next_key = keyring.report_exhausted(key)
                 if next_key and next_key != key:
+                    reason = ("rejected as invalid"
+                              if isinstance(exc, InvalidKeyError)
+                              else "hit its daily limit")
+                    self.events.emit(
+                        "key_rotated",
+                        f"API {keyring.label(spent)} {reason} — rotated to "
+                        f"{keyring.label(next_key)}, retrying {site}.",
+                        level="warn",
+                    )
                     key = next_key
                     continue
                 break  # every key is now unusable
             except WPScanError as exc:
                 self.db.update_scan(scan_id, status="error", finished_at=time.time(),
                                     error=str(exc))
+                self.events.emit("target_done",
+                                 f"[{index}/{total}] {site} failed: {exc}",
+                                 level="error")
+                self._mark_done()
                 return
             except Exception as exc:  # noqa: BLE001 — never let one site kill the batch
                 self.db.update_scan(scan_id, status="error", finished_at=time.time(),
                                     error=f"Unexpected error: {exc}")
+                self.events.emit("target_done",
+                                 f"[{index}/{total}] {site} failed: {exc}",
+                                 level="error")
+                self._mark_done()
                 return
 
         # Fell out of the loop: no usable key remaining.
@@ -431,6 +567,13 @@ class ScanManager:
                    f"rejected (free plan = 25 requests/day per key). Try again "
                    f"later or add more keys. Last response: {last_limit_err}")
         self.db.update_scan(scan_id, status="error", finished_at=time.time(), error=msg)
+        self.events.emit("target_done", f"[{index}/{total}] {site}: {msg}",
+                         level="error")
+        self._mark_done()
+
+    def _mark_done(self) -> None:
+        with self._lock:
+            self._done += 1
 
 
 def ingest_directory(db: Database, directory: str) -> int:

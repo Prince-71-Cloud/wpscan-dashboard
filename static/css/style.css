@@ -253,3 +253,94 @@ table.findings { width: 100%; border-collapse: collapse; min-width: 900px; }
 @media (prefers-reduced-motion: reduce) {
   * { animation: none !important; transition: none !important; }
 }
+
+/* ------------------------------------------------------------------ *
+ * Scan progress toasts
+ * Bottom-right so they never cover the findings table or the toolbar.
+ * Colour is carried by a left rule, matching the severity-scale idiom.
+ * ------------------------------------------------------------------ */
+.toasts {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: min(390px, calc(100vw - 36px));
+  pointer-events: none;            /* clicks pass through the empty stack */
+}
+
+.toast {
+  pointer-events: auto;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  background: var(--surface-2);
+  border: 1px solid var(--border-2);
+  border-left: 3px solid var(--info);
+  border-radius: var(--radius);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, .45);
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.45;
+  animation: toast-in .22s ease-out;
+}
+
+.toast--out { animation: toast-out .2s ease-in forwards; }
+
+.toast__icon {
+  flex: none;
+  width: 16px;
+  text-align: center;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--info);
+}
+
+.toast__msg {
+  flex: 1;
+  min-width: 0;
+  word-break: break-word;
+}
+
+.toast__close {
+  flex: none;
+  background: none;
+  border: 0;
+  color: var(--faint);
+  font-size: 17px;
+  line-height: 1;
+  padding: 0 2px;
+  cursor: pointer;
+}
+.toast__close:hover { color: var(--text); }
+
+/* Level colouring reuses the semantic scale */
+.toast--success { border-left-color: var(--ok); }
+.toast--success .toast__icon { color: var(--ok); }
+.toast--warn    { border-left-color: var(--medium); }
+.toast--warn .toast__icon { color: var(--medium); }
+.toast--error   { border-left-color: var(--critical); }
+.toast--error .toast__icon { color: var(--critical); }
+.toast--info    { border-left-color: var(--accent); }
+.toast--info .toast__icon { color: var(--accent); }
+
+@keyframes toast-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes toast-out {
+  from { opacity: 1; transform: translateY(0); }
+  to   { opacity: 0; transform: translateX(12px); }
+}
+
+@media (max-width: 640px) {
+  .toasts { left: 12px; right: 12px; bottom: 12px; width: auto; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .toast, .toast--out { animation: none; }
+}

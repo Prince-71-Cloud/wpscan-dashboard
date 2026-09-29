@@ -91,6 +91,9 @@
     </section>
   </main>
 
+  <!-- Scan progress notifications (populated by dashboard.js) -->
+  <div id="toasts" class="toasts" aria-live="polite" aria-atomic="false"></div>
+
   <script src="{{ url_for('static', filename='js/dashboard.js') }}"></script>
 </body>
 </html>
