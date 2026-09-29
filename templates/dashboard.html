@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WPScan Console</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <div>
+        <h1>WPScan Console</h1>
+        <p class="brand-sub">Consolidated WordPress vulnerability monitoring</p>
+      </div>
+    </div>
+    <div class="actions">
+      <span id="scan-state" class="scan-state" hidden></span>
+      <button id="btn-scan" class="btn btn-primary">Run scan</button>
+      <button id="btn-samples" class="btn">Load sample data</button>
+      <button id="btn-clear" class="btn btn-ghost">Clear</button>
+    </div>
+  </header>
+
+  <main>
+    <!-- Hero: security posture at a glance -->
+    <section class="posture" aria-label="Security posture">
+      <div class="posture-stats">
+        <div class="stat">
+          <span id="stat-sites" class="stat-value">0</span>
+          <span class="stat-label">sites scanned</span>
+        </div>
+        <div class="stat">
+          <span id="stat-total" class="stat-value">0</span>
+          <span class="stat-label">open findings</span>
+        </div>
+      </div>
+      <div class="posture-bar-wrap">
+        <div id="posture-bar" class="posture-bar" role="img" aria-label="Findings by severity"></div>
+        <div id="severity-legend" class="legend"></div>
+      </div>
+    </section>
+
+    <!-- Per-target scan status, including failures -->
+    <section id="targets" class="targets" aria-label="Scan targets"></section>
+
+    <!-- Filter / sort toolbar -->
+    <section class="toolbar">
+      <input id="search" type="search" class="input" placeholder="Search title, component, CVE…" aria-label="Search findings">
+      <select id="filter-site" class="input" aria-label="Filter by site"></select>
+      <select id="filter-type" class="input" aria-label="Filter by component type">
+        <option value="">All components</option>
+        <option value="core">Core</option>
+        <option value="plugin">Plugin</option>
+        <option value="theme">Theme</option>
+        <option value="config">Config</option>
+        <option value="server">Server</option>
+        <option value="user">User</option>
+      </select>
+      <select id="sort" class="input" aria-label="Sort findings">
+        <option value="severity">Sort: severity</option>
+        <option value="site">Sort: site</option>
+        <option value="component_type">Sort: component type</option>
+        <option value="component_name">Sort: component</option>
+      </select>
+      <span id="result-count" class="result-count"></span>
+    </section>
+
+    <!-- Findings table -->
+    <section class="table-wrap">
+      <table class="findings" aria-label="Vulnerability findings">
+        <thead>
+          <tr>
+            <th class="col-sev">Severity</th>
+            <th class="col-title">Finding</th>
+            <th class="col-site">Site</th>
+            <th class="col-comp">Component</th>
+            <th class="col-ver">Version</th>
+            <th class="col-fix">Fixed in</th>
+            <th class="col-ref">References</th>
+          </tr>
+        </thead>
+        <tbody id="findings-body"></tbody>
+      </table>
+      <div id="empty" class="empty" hidden>
+        <p class="empty-title">No findings yet</p>
+        <p class="empty-body">Run a scan against the sites in <code>sites.txt</code>, or load
+          the bundled sample reports to explore the console.</p>
+      </div>
+    </section>
+  </main>
+
+  <script src="{{ url_for('static', filename='js/dashboard.js') }}"></script>
+</body>
+</html>

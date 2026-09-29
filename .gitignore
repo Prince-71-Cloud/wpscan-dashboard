@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+dashboard.db
+venv/
+.venv/
+
+# Secret: your real WPScan API keys live here — never commit them.
+# Copy api_keys.txt.example to api_keys.txt and add your keys.
+api_keys.txt
+!api_keys.txt.example

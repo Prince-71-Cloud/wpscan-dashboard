@@ -1,0 +1,61 @@
+{
+  "target_url": "https://shop.example.net/",
+  "effective_url": "https://shop.example.net/",
+  "target_ip": "198.51.100.44",
+  "interesting_findings": [
+    {
+      "url": "https://shop.example.net/",
+      "to_s": "Headers",
+      "type": "headers",
+      "found_by": "Headers (Passive Detection)",
+      "confidence": 100,
+      "interesting_entries": ["server: nginx", "x-powered-by: PHP/7.4.3"],
+      "references": {}
+    }
+  ],
+  "config_backups": {
+    "https://shop.example.net/wp-config.php.bak": {
+      "found_by": "Known Filenames (Aggressive Detection)",
+      "confidence": 100
+    }
+  },
+  "version": {
+    "number": "6.4.2",
+    "release_date": "2023-12-06",
+    "status": "latest",
+    "found_by": "Rss Generator (Passive Detection)",
+    "confidence": 100,
+    "vulnerabilities": []
+  },
+  "main_theme": {
+    "slug": "storefront",
+    "version": { "number": "4.5.3" },
+    "outdated": false,
+    "vulnerabilities": []
+  },
+  "plugins": {
+    "woocommerce": {
+      "slug": "woocommerce",
+      "version": { "number": "7.8.0" },
+      "outdated": true,
+      "latest_version": "8.4.0",
+      "vulnerabilities": [
+        {
+          "title": "WooCommerce 3.0.0-7.8.1 - Authenticated (Contributor+) Stored Cross-Site Scripting",
+          "fixed_in": "7.8.2",
+          "references": {
+            "cve": ["2023-4634"],
+            "cvss": { "score": "5.9" },
+            "url": ["https://wpscan.com/vulnerability/example-woo-xss"]
+          }
+        }
+      ]
+    },
+    "yoast-seo": {
+      "slug": "yoast-seo",
+      "version": { "number": "21.5" },
+      "outdated": false,
+      "vulnerabilities": []
+    }
+  }
+}

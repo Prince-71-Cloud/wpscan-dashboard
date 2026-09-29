@@ -1,0 +1,6 @@
+# WordPress sites to monitor — one URL per line.
+# Lines starting with '#' are ignored. A missing scheme defaults to https://.
+# Only list sites you are authorized to scan.
+https://blog.example.com
+https://shop.example.net
+https://docs.example.org

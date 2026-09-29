@@ -1,0 +1,37 @@
+{
+  "target_url": "https://docs.example.org/",
+  "effective_url": "https://docs.example.org/",
+  "target_ip": "192.0.2.87",
+  "interesting_findings": [
+    {
+      "url": "https://docs.example.org/",
+      "to_s": "Headers",
+      "type": "headers",
+      "found_by": "Headers (Passive Detection)",
+      "confidence": 100,
+      "interesting_entries": ["server: cloudflare"],
+      "references": {}
+    }
+  ],
+  "version": {
+    "number": "6.4.2",
+    "release_date": "2023-12-06",
+    "status": "latest",
+    "confidence": 100,
+    "vulnerabilities": []
+  },
+  "main_theme": {
+    "slug": "twentytwentyfour",
+    "version": { "number": "1.0" },
+    "outdated": false,
+    "vulnerabilities": []
+  },
+  "plugins": {
+    "wordfence": {
+      "slug": "wordfence",
+      "version": { "number": "7.11.0" },
+      "outdated": false,
+      "vulnerabilities": []
+    }
+  }
+}
