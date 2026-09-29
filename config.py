@@ -6,6 +6,11 @@ the dashboard runs out of the box and can be tuned for a real deployment
 without code changes.
 
   WPSCAN_PATH        path to the wpscan binary                 (default: wpscan)
+  WPSCAN_ENUMERATE   what wpscan enumerates (vp,vt,u,cb,dbe)   (default: vp,vt,u,cb,dbe)
+  WPSCAN_PLUGINS_DETECTION  plugin detection mode              (default: aggressive)
+  WPSCAN_EXTRA_ARGS  extra raw wpscan args (advanced)          (default: none)
+  EXTRA_CHECKS       run passive web-hygiene checks too        (default: true)
+  CHECK_TIMEOUT      per-request timeout for hygiene checks    (default: 10)
   WPSCAN_API_TOKEN   single token (optional; added to the key   (default: none)
                      ring alongside API_KEYS_FILE)
   API_KEYS_FILE      file of WPScan API keys, one per line,     (default: api_keys.txt)
@@ -30,6 +35,11 @@ def _int(name: str, default: int) -> int:
 
 CONFIG = {
     "WPSCAN_PATH":      os.environ.get("WPSCAN_PATH", "wpscan"),
+    "WPSCAN_ENUMERATE": os.environ.get("WPSCAN_ENUMERATE", "vp,vt,u,cb,dbe"),
+    "WPSCAN_PLUGINS_DETECTION": os.environ.get("WPSCAN_PLUGINS_DETECTION", "aggressive"),
+    "WPSCAN_EXTRA_ARGS": os.environ.get("WPSCAN_EXTRA_ARGS") or None,
+    "EXTRA_CHECKS":     os.environ.get("EXTRA_CHECKS", "true"),
+    "CHECK_TIMEOUT":    _int("CHECK_TIMEOUT", 10),
     "WPSCAN_API_TOKEN": os.environ.get("WPSCAN_API_TOKEN") or None,
     "API_KEYS_FILE":    os.environ.get("API_KEYS_FILE", "api_keys.txt"),
     "SITES_FILE":       os.environ.get("SITES_FILE", "sites.txt"),

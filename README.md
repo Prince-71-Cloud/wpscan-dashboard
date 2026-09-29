@@ -65,14 +65,49 @@ console immediately — no WPScan install or live targets needed.
    rotated, and a summary when the whole batch finishes. The header badge shows
    live progress (`Scanning… 2/3`).
 
-Without any keys, WPScan still enumerates the site but returns limited
-vulnerability data — the dashboard shows whatever it gets.
+Scans run a thorough enumeration by default —
+`--enumerate vp,vt,u,cb,dbe --plugins-detection aggressive` — so vulnerable
+plugins, vulnerable themes, users, config backups and DB exports are all
+surfaced, not just the version WordPress advertises on its homepage. This is
+slower and noisier than a passive scan; that is the trade-off for completeness.
+Tune it with `WPSCAN_ENUMERATE` / `WPSCAN_PLUGINS_DETECTION`, or pass raw flags
+(throttling, threads) via `WPSCAN_EXTRA_ARGS`.
+
+Each successful WPScan is also followed by a set of **passive web-hygiene
+checks** (see below). Without any API keys, WPScan still enumerates the site but
+returns limited vulnerability data — the dashboard shows whatever it gets.
 
 ## Ingesting existing reports
 
 Drop WPScan JSON reports (produced with `wpscan --url ... --format json -o
 report.json`) into `sample_scans/` (or set `SAMPLE_DIR`) and click **Load sample
 data**, or POST to `/api/ingest-samples`.
+
+---
+
+## What it checks
+
+**WPScan (with API keys):** vulnerable WordPress core/version, vulnerable
+plugins and their versions, vulnerable themes, enumerated users, config backups
+and database exports.
+
+**Passive web-hygiene checks** (run after each successful WPScan; toggle with
+`EXTRA_CHECKS`): missing security headers (CSP, X-Frame-Options, HSTS, etc.),
+permissive CORS, HTTP-vs-HTTPS and weak TLS protocol, directory listing,
+REST-API user enumeration (`/wp-json/wp/v2/users`), a reachable admin login
+page, and a small curated set of commonly-exposed sensitive files
+(`/wp-content/debug.log`, `/_wpeprivate/config.json`, `wp-config` backups,
+`.env`, `readme.html`, `xmlrpc.php`). These are unauthenticated GET requests and
+header inspection only — bounded, rate-limited, and gentle on the target.
+
+**Deliberately not included:** credential brute-forcing / password spraying
+(Hydra, Burp Intruder, "common admin password"), and active exploitation of
+findings (SSRF, HLI, etc.). Those are intrusive attacks that cause account
+lockouts and outages; this tool is for *assessment*, and automating them into a
+point-and-shoot dashboard is out of scope by design. If you run an authorised
+engagement that calls for a throttled WordPress password audit, WPScan's own
+`--passwords` option exists for that — run it directly, against sites you are
+authorised to test, with agreed rules of engagement.
 
 ---
 
@@ -106,6 +141,11 @@ All settings are environment variables (see `config.py`):
 | Variable | Default | Purpose |
 |---|---|---|
 | `WPSCAN_PATH` | `wpscan` | Path to the WPScan binary |
+| `WPSCAN_ENUMERATE` | `vp,vt,u,cb,dbe` | What WPScan enumerates |
+| `WPSCAN_PLUGINS_DETECTION` | `aggressive` | Plugin detection mode (`passive`/`mixed`/`aggressive`) |
+| `WPSCAN_EXTRA_ARGS` | *(none)* | Extra raw wpscan args, e.g. `--throttle 500` |
+| `EXTRA_CHECKS` | `true` | Run passive web-hygiene checks after each scan |
+| `CHECK_TIMEOUT` | `10` | Per-request timeout for hygiene checks (seconds) |
 | `WPSCAN_API_TOKEN` | *(none)* | Optional single key, added to the front of the rotation |
 | `API_KEYS_FILE` | `api_keys.txt` | File of API keys, rotated when one hits its daily limit |
 | `SITES_FILE` | `sites.txt` | Target list |

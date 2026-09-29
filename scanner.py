@@ -223,6 +223,23 @@ def read_api_keys(path: str) -> list[str]:
     return keys
 
 
+def _truthy(val: Any) -> bool:
+    if isinstance(val, bool):
+        return val
+    return str(val).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _split_args(raw: str | None) -> list[str] | None:
+    """Split a WPSCAN_EXTRA_ARGS string into argv, respecting quotes."""
+    if not raw:
+        return None
+    import shlex
+    try:
+        return shlex.split(raw)
+    except ValueError:
+        return None
+
+
 def build_keyring(config: dict[str, Any]) -> KeyRing:
     """
     Assemble the key ring from config: an explicit WPSCAN_API_TOKEN (if set) is
@@ -242,11 +259,26 @@ def run_wpscan(
     wpscan_path: str = "wpscan",
     api_token: str | None = None,
     timeout: int = 600,
+    enumerate: str | None = "vp,vt,u,cb,dbe",
+    plugins_detection: str | None = "aggressive",
     extra_args: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Run WPScan against one URL and return the parsed JSON report."""
+    """Run WPScan against one URL and return the parsed JSON report.
+
+    The enumeration flags are what make the scan *thorough* rather than fast and
+    shallow. Defaults mirror a typical audit invocation:
+      vp = vulnerable plugins, vt = vulnerable themes, u = users,
+      cb = config backups, dbe = db exports.
+    `plugins_detection=aggressive` probes for plugins by requesting known paths
+    instead of only reading what the homepage advertises — far more complete,
+    but slower and noisier, so it is configurable.
+    """
     cmd = [wpscan_path, "--url", url, "--format", "json", "--no-banner",
            "--random-user-agent"]
+    if enumerate:
+        cmd += ["--enumerate", enumerate]
+    if plugins_detection:
+        cmd += ["--plugins-detection", plugins_detection]
     if api_token:
         cmd += ["--api-token", api_token]
     if extra_args:
@@ -494,18 +526,42 @@ class ScanManager:
                     wpscan_path=self.config.get("WPSCAN_PATH", "wpscan"),
                     api_token=key,
                     timeout=int(self.config.get("SCAN_TIMEOUT", 600)),
+                    enumerate=self.config.get("WPSCAN_ENUMERATE", "vp,vt,u,cb,dbe"),
+                    plugins_detection=self.config.get(
+                        "WPSCAN_PLUGINS_DETECTION", "aggressive"),
+                    extra_args=_split_args(self.config.get("WPSCAN_EXTRA_ARGS")),
                 )
                 parsed = report_parser.parse_report(report, site_hint=site)
-                self.db.replace_findings(parsed["site"], scan_id, parsed["findings"])
+                wp_findings = parsed["findings"]
+
+                # Add passive web-hygiene checks (headers, CORS, TLS, exposed
+                # files, directory listing, REST user enumeration) that WPScan
+                # doesn't cover. Optional and best-effort — never fail the scan.
+                extra_findings: list[dict[str, Any]] = []
+                if _truthy(self.config.get("EXTRA_CHECKS", True)):
+                    try:
+                        import checks
+                        extra_findings = checks.run_passive_checks(
+                            parsed["site"],
+                            timeout=int(self.config.get("CHECK_TIMEOUT", 10)),
+                        )
+                    except Exception:  # noqa: BLE001 — hygiene checks are optional
+                        extra_findings = []
+
+                all_findings = wp_findings + extra_findings
+                self.db.replace_findings(parsed["site"], scan_id, all_findings)
                 self.db.update_scan(
                     scan_id, status="success", finished_at=time.time(),
                     wp_version=parsed.get("wp_version"),
                     target_ip=parsed.get("target_ip"),
                 )
-                n = len(parsed["findings"])
+                n = len(all_findings)
+                extra_note = (f" ({len(wp_findings)} WPScan + "
+                              f"{len(extra_findings)} hygiene)"
+                              if extra_findings else "")
                 self.events.emit(
                     "target_done",
-                    f"[{index}/{total}] {site} done — {n} finding(s).",
+                    f"[{index}/{total}] {site} done — {n} finding(s){extra_note}.",
                     level="success",
                 )
                 self._mark_done()
