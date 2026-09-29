@@ -344,3 +344,31 @@ table.findings { width: 100%; border-collapse: collapse; min-width: 900px; }
 @media (prefers-reduced-motion: reduce) {
   .toast, .toast--out { animation: none; }
 }
+
+/* Retry control on a failed target chip */
+.target .retry {
+  flex: none;
+  margin-left: 2px;
+  width: 20px;
+  height: 20px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: 1px solid rgba(255, 93, 108, .45);
+  color: var(--critical);
+  border-radius: 5px;
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background .12s, transform .12s;
+}
+.target .retry:hover:not(:disabled) {
+  background: var(--critical-bg);
+  transform: rotate(-90deg);      /* nod to "reload" */
+}
+.target .retry:disabled { opacity: .4; cursor: not-allowed; }
+.target .retry:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}

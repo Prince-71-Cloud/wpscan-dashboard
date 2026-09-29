@@ -1,6 +1,13 @@
-# WordPress sites to monitor — one URL per line.
-# Lines starting with '#' are ignored. A missing scheme defaults to https://.
-# Only list sites you are authorized to scan.
-https://blog.example.com
-https://shop.example.net
-https://docs.example.org
+https://vivasoftltd.com
+https://kothon.ai
+http://mypihr.com
+http://financfy.com
+https://cloudomnium.com
+http://vivasoft.com.np
+https://vivasoft.uk
+https://vivasoft.my
+https://previea.ai
+https://greenfeather.tech
+https://ryokusystems.com.au
+https://trainrfactory.com
+https://novara.my
