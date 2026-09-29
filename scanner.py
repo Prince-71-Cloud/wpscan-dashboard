@@ -35,11 +35,20 @@ from db import Database
 #   0 = clean, 5 = vulnerabilities found. 3 = no WP detected, 4 = no connection.
 _PARSEABLE_EXIT_CODES = {0, 5}
 
-# Substrings WPScan uses (in its "scan_aborted" message or on stderr) when the
-# API key's daily request quota is spent. Matched case-insensitively.
+# Substrings WPScan uses (in "scan_aborted", in the report's "vuln_api" block,
+# or on stderr) when the API key's daily request quota is spent. WPScan's exact
+# wording is "Your API limit has been reached". Matched case-insensitively.
 _RATE_LIMIT_MARKERS = (
-    "api limit", "plan limit", "request limit", "rate limit", "throttl",
-    "429", "too many requests", "reached your",
+    "api limit", "plan limit", "request limit", "rate limit", "rate limit hit",
+    "limit has been reached", "throttl", "429", "too many requests",
+)
+
+# WPScan's wording when a key is rejected outright: "The API token provided is
+# invalid". A bad key should be dropped and the next one tried, not treated as
+# a fatal scan error.
+_INVALID_KEY_MARKERS = (
+    "token provided is invalid", "invalid api token", "invalid token",
+    "unauthorized", "401", "403",
 )
 
 
@@ -47,8 +56,16 @@ class WPScanError(Exception):
     pass
 
 
-class RateLimitError(WPScanError):
-    """Raised when a scan fails specifically because the API key is exhausted."""
+class KeyProblem(WPScanError):
+    """Base for errors that mean 'this key is unusable — try the next one'."""
+
+
+class RateLimitError(KeyProblem):
+    """The current API key's daily quota is spent."""
+
+
+class InvalidKeyError(KeyProblem):
+    """The current API key was rejected by the WPScan API."""
 
 
 def _looks_like_rate_limit(message: str) -> bool:
@@ -56,15 +73,57 @@ def _looks_like_rate_limit(message: str) -> bool:
     return any(marker in msg for marker in _RATE_LIMIT_MARKERS)
 
 
+def _looks_like_invalid_key(message: str) -> bool:
+    msg = (message or "").lower()
+    return any(marker in msg for marker in _INVALID_KEY_MARKERS)
+
+
+def _api_problem_in_report(report: dict[str, Any]) -> str | None:
+    """
+    WPScan does not always abort when the API rejects a key: it can finish the
+    scan and record the problem inside the report's "vuln_api" block, leaving a
+    report that looks successful but carries no vulnerability data. Return the
+    error text if the vuln API reported a problem, else None.
+    """
+    api = report.get("vuln_api")
+    if not isinstance(api, dict):
+        return None
+    err = api.get("error")
+    if err:
+        return str(err)
+    # Some builds nest the HTTP failure instead.
+    http_err = api.get("http_error")
+    if http_err:
+        return str(http_err)
+    return None
+
+
+def _requests_remaining(report: dict[str, Any]) -> int | None:
+    """Quota left on the key used for this scan, when WPScan reports it."""
+    api = report.get("vuln_api")
+    if not isinstance(api, dict):
+        return None
+    val = api.get("requests_remaining")
+    if isinstance(val, int):
+        return val
+    return None
+
+
 class KeyRing:
     """
     Thread-safe ring of WPScan API keys.
 
     The free WPScan plan allows 25 requests/key/day, so a fleet of keys extends
-    daily capacity. Scans share one ring: when a key comes back rate-limited it
-    is marked exhausted and the ring advances to the next usable key. Because the
-    quota is per key per day (not per site), the exhausted state is global for
-    the life of the process and shared across the concurrent scan threads.
+    daily capacity. Two things make all of your keys actually get used:
+
+      * lease()  — hands out keys round-robin, so successive sites in a batch use
+        different keys and the daily quota is spread across the whole ring
+        instead of draining key #1 first.
+      * report_exhausted() — marks a key spent (rate-limited or rejected) and
+        returns the next usable one, so a scan can be retried immediately.
+
+    Exhausted state is global for the life of the process (the quota is per key
+    per day, not per site) and shared across concurrent scan threads.
     """
 
     def __init__(self, keys: list[str]):
@@ -81,12 +140,35 @@ class KeyRing:
     def count(self) -> int:
         return len(self._keys)
 
+    def keys(self) -> list[str]:
+        return list(self._keys)
+
     def active_count(self) -> int:
         with self._lock:
             return len([k for k in self._keys if k not in self._exhausted])
 
+    def exhausted_keys(self) -> list[str]:
+        with self._lock:
+            return [k for k in self._keys if k in self._exhausted]
+
+    def lease(self) -> str | None:
+        """
+        Claim the next usable key, round-robin. Each caller (i.e. each site scan)
+        gets the following key in the ring, so a batch spreads its requests over
+        every key you listed rather than hammering the first one.
+        """
+        with self._lock:
+            if not self._keys:
+                return None
+            for _ in range(len(self._keys)):
+                key = self._keys[self._idx]
+                self._idx = (self._idx + 1) % len(self._keys)
+                if key not in self._exhausted:
+                    return key
+            return None  # every key spent
+
     def current(self) -> str | None:
-        """The key a scan should use right now, or None if there are none/all spent."""
+        """Peek at the key the ring is pointing at, without claiming it."""
         with self._lock:
             if not self._keys:
                 return None
@@ -95,7 +177,7 @@ class KeyRing:
 
     def report_exhausted(self, key: str) -> str | None:
         """
-        Mark `key` spent and return the next usable key (or None if all are spent).
+        Mark `key` unusable and return the next usable key (None if all spent).
         Safe to call from multiple threads that hit the limit on the same key.
         """
         with self._lock:
@@ -103,16 +185,12 @@ class KeyRing:
                 self._exhausted.add(key)
             if not self._keys:
                 return None
-            # Only advance the shared pointer if it is still on the spent key;
-            # another thread may already have rotated us forward.
-            if self._keys[self._idx] == key:
-                for _ in range(len(self._keys)):
-                    self._idx = (self._idx + 1) % len(self._keys)
-                    if self._keys[self._idx] not in self._exhausted:
-                        return self._keys[self._idx]
-                return None
-            cur = self._keys[self._idx]
-            return None if cur in self._exhausted else cur
+            for _ in range(len(self._keys)):
+                candidate = self._keys[self._idx]
+                self._idx = (self._idx + 1) % len(self._keys)
+                if candidate not in self._exhausted:
+                    return candidate
+            return None
 
 
 def read_api_keys(path: str) -> list[str]:
@@ -178,7 +256,21 @@ def run_wpscan(
             detail = str(report["scan_aborted"])
             if _looks_like_rate_limit(detail):
                 raise RateLimitError(f"{url}: {detail}")
+            if _looks_like_invalid_key(detail):
+                raise InvalidKeyError(f"{url}: {detail}")
             raise WPScanError(f"{url}: {detail}")
+
+        # A report can come back "successful" while the vulnerability API was
+        # refusing the key the whole time — the scan then contains enumeration
+        # data but no vuln data. Treat that as a key problem so the caller can
+        # rotate and re-scan, rather than silently storing an incomplete result.
+        api_problem = _api_problem_in_report(report)
+        if api_problem:
+            if _looks_like_rate_limit(api_problem):
+                raise RateLimitError(f"{url}: {api_problem}")
+            if _looks_like_invalid_key(api_problem):
+                raise InvalidKeyError(f"{url}: {api_problem}")
+            raise WPScanError(f"{url}: vuln API error: {api_problem}")
         return report
 
     # No JSON -> surface the most useful error text we can find.
@@ -187,6 +279,8 @@ def run_wpscan(
     detail = stderr or stdout or f"exit code {proc.returncode}"
     if _looks_like_rate_limit(detail):
         raise RateLimitError(f"{url}: {detail[:500]}")
+    if _looks_like_invalid_key(detail):
+        raise InvalidKeyError(f"{url}: {detail[:500]}")
     raise WPScanError(f"WPScan produced no report for {url}: {detail[:500]}")
 
 
@@ -281,8 +375,10 @@ class ScanManager:
     def _scan_one(self, site: str, scan_id: int) -> None:
         import time
         keyring = self._keyring
-        key = keyring.current()
-        # At least one attempt; up to one attempt per key if we keep hitting limits.
+        # Claim a key round-robin so each site in the batch uses a different key
+        # and the daily quota is spread across every key in the file.
+        key = keyring.lease()
+        # At least one attempt; up to one attempt per key if keys keep failing.
         attempts = max(1, keyring.count())
         last_limit_err: Exception | None = None
 
@@ -301,15 +397,22 @@ class ScanManager:
                     wp_version=parsed.get("wp_version"),
                     target_ip=parsed.get("target_ip"),
                 )
+                # Scan succeeded, but if that used up the key's quota, retire it
+                # now so the next site doesn't waste an attempt discovering it.
+                remaining = _requests_remaining(report)
+                if key and remaining is not None and remaining <= 0:
+                    keyring.report_exhausted(key)
                 return
-            except RateLimitError as exc:
-                # Current key is spent — mark it and rotate to the next one.
+            except KeyProblem as exc:
+                # Key is spent or rejected — retire it and retry on the next one.
                 last_limit_err = exc
-                next_key = keyring.report_exhausted(key) if key else None
+                if not key:
+                    break  # no keys configured at all; nothing to rotate to
+                next_key = keyring.report_exhausted(key)
                 if next_key and next_key != key:
                     key = next_key
                     continue
-                break  # no key set, or every key exhausted
+                break  # every key is now unusable
             except WPScanError as exc:
                 self.db.update_scan(scan_id, status="error", finished_at=time.time(),
                                     error=str(exc))
@@ -319,14 +422,14 @@ class ScanManager:
                                     error=f"Unexpected error: {exc}")
                 return
 
-        # Fell out of the loop: rate-limited with no usable key remaining.
+        # Fell out of the loop: no usable key remaining.
         if keyring.count() == 0:
-            msg = ("Rate-limited and no WPScan API keys configured. Add keys to "
-                   "api_keys.txt for full vulnerability data.")
+            msg = ("WPScan API key required for vulnerability data, but none are "
+                   "configured. Add keys to api_keys.txt (one per line).")
         else:
-            msg = (f"All {keyring.count()} WPScan API key(s) are rate-limited "
-                   f"(25 requests/day each). Try again later or add more keys. "
-                   f"Last response: {last_limit_err}")
+            msg = (f"All {keyring.count()} WPScan API key(s) are exhausted or "
+                   f"rejected (free plan = 25 requests/day per key). Try again "
+                   f"later or add more keys. Last response: {last_limit_err}")
         self.db.update_scan(scan_id, status="error", finished_at=time.time(), error=msg)
 
 
@@ -353,3 +456,38 @@ def ingest_directory(db: Database, directory: str) -> int:
             sid = db.create_scan(name, status="error", source="ingest")
             db.update_scan(sid, error=str(exc), finished_at=time.time())
     return count
+
+
+# --------------------------------------------------------------------------- #
+# Diagnostics: `python scanner.py` shows which keys were loaded
+# --------------------------------------------------------------------------- #
+def _mask(key: str) -> str:
+    """Show enough of a key to identify it without printing the secret."""
+    if len(key) <= 8:
+        return key[:2] + "…" + key[-2:]
+    return f"{key[:4]}…{key[-4:]} ({len(key)} chars)"
+
+
+if __name__ == "__main__":
+    from config import CONFIG
+
+    path = CONFIG["API_KEYS_FILE"]
+    print(f"Key file : {os.path.abspath(path)}")
+    print(f"Exists   : {os.path.exists(path)}")
+
+    file_keys = read_api_keys(path)
+    print(f"Keys read from file: {len(file_keys)}")
+    for i, k in enumerate(file_keys, 1):
+        print(f"  {i}. {_mask(k)}")
+
+    if CONFIG.get("WPSCAN_API_TOKEN"):
+        print(f"Plus WPSCAN_API_TOKEN env var: {_mask(CONFIG['WPSCAN_API_TOKEN'])}")
+
+    ring = build_keyring(CONFIG)
+    print(f"\nUsable keys in rotation (after de-duplication): {ring.count()}")
+    if ring.count() == 0:
+        print("  !! No keys loaded. Check that the file exists, is in this")
+        print("     directory, and has one key per line (no quotes, no commas).")
+    else:
+        order = [_mask(ring.lease() or "-") for _ in range(ring.count())]
+        print(f"  Round-robin order across sites: {', '.join(order)}")

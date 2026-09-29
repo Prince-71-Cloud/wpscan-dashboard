@@ -42,12 +42,21 @@ console immediately — no WPScan install or live targets needed.
    #   fedcba9876543210fedcba9876543210fedcba9876543210fe
    ```
    The free plan allows **25 requests per key per day**, so list as many keys as
-   you have — the dashboard uses them in order and **rotates to the next key
-   automatically** when one hits its daily limit. A scan only reports a
-   rate-limit error once every key is spent. The key file is re-read at the start
-   of each scan batch, so you can add keys without restarting, and it is
-   `.gitignore`d so your keys are never committed. (A single `WPSCAN_API_TOKEN`
-   env var still works too and is added to the front of the rotation.)
+   you have. The dashboard uses them **round-robin** — each site in a batch takes
+   the next key in the list, so the daily quota is spread across every key rather
+   than draining the first one. If a key comes back rate-limited or rejected, it
+   is retired for the session and the scan is **retried immediately on the next
+   key**; a site only errors once every key is spent. Keys are re-read at the
+   start of each scan batch, so you can add keys without restarting, and
+   `api_keys.txt` is `.gitignore`d so your keys are never committed. (A single
+   `WPSCAN_API_TOKEN` env var still works and joins the rotation.)
+
+   To confirm your keys are being read, run:
+   ```bash
+   python scanner.py
+   ```
+   It prints the resolved key-file path, how many keys were parsed (masked), and
+   the round-robin order — useful if you suspect only one key is in play.
 3. List your targets in `sites.txt` (one URL per line; `#` comments allowed).
 4. Start the app and click **Run scan**. Scans run in the background; the target
    chips turn green (success) or red (failed), and the table fills in as results
