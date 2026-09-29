@@ -73,8 +73,18 @@ def api_findings():
 
 @app.route("/api/scan", methods=["POST"])
 def api_scan():
-    sites = (request.json or {}).get("sites") if request.is_json else None
-    if not sites:
+    body = request.json if request.is_json else None
+    sites = None
+    if body:
+        # Accept either {"sites": [...]} or {"site": "..."} (single retry).
+        sites = body.get("sites")
+        if not sites and body.get("site"):
+            sites = [body["site"]]
+    if sites:
+        # Normalize the same way sites.txt is read, so a retry matches the
+        # stored target exactly (scheme added, trailing slash trimmed).
+        sites = [scanner.normalize_site(s) for s in sites if s and s.strip()]
+    else:
         sites = scanner.read_sites(CONFIG["SITES_FILE"])
     if not sites:
         return jsonify({"error": f"No sites found in {CONFIG['SITES_FILE']}."}), 400

@@ -359,6 +359,17 @@ def ingest_file(path: str) -> dict[str, Any]:
             raise WPScanError(f"{path} is not valid WPScan JSON: {exc}") from exc
 
 
+def normalize_site(raw: str) -> str:
+    """Normalize a site URL the same way for both sites.txt and single retries:
+    default to https://, strip a trailing slash."""
+    line = (raw or "").strip()
+    if not line:
+        return ""
+    if not line.startswith(("http://", "https://")):
+        line = "https://" + line
+    return line.rstrip("/")
+
+
 def read_sites(path: str) -> list[str]:
     """Read site URLs from a text file (one per line, '#' comments allowed)."""
     if not os.path.exists(path):
@@ -369,9 +380,7 @@ def read_sites(path: str) -> list[str]:
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
-            if not line.startswith(("http://", "https://")):
-                line = "https://" + line
-            sites.append(line.rstrip("/"))
+            sites.append(normalize_site(line))
     return sites
 
 

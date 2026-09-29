@@ -12,6 +12,7 @@ const state = {
   pollTimer: null,
   lastEventId: 0,       // cursor so each progress toast is shown exactly once
   primed: false,        // suppress replaying old events on first page load
+  scanning: false,
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -29,6 +30,7 @@ async function load() {
   const data = await res.json();
   state.findings = data.findings || [];
   state.sites = data.sites || [];
+  state.scanning = !!data.scanning;
 
   // On first load, jump the cursor to the end so a page refresh mid-session
   // doesn't replay every event as a burst of toasts.
@@ -154,6 +156,7 @@ function renderPosture(summary) {
 function renderTargets(sites) {
   const wrap = $("#targets");
   wrap.innerHTML = "";
+  const scanning = state.scanning;
   sites.forEach((s) => {
     const status = s.status || "not scanned";
     const cls = status === "success" ? "success"
@@ -166,12 +169,46 @@ function renderTargets(sites) {
       const e = el("span", "err", "scan failed");
       e.title = s.error;
       node.appendChild(e);
+      // Retry just this target (a batch of one) without re-running everything.
+      const retry = el("button", "retry", "↻");
+      retry.type = "button";
+      retry.title = scanning ? "A scan is already running" : `Retry ${host(s.site)}`;
+      retry.setAttribute("aria-label", `Retry scan of ${host(s.site)}`);
+      retry.disabled = scanning;
+      retry.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        retryTarget(s.site);
+      });
+      node.appendChild(retry);
     } else if (status === "success" && s.wp_version) {
       node.appendChild(el("span", "err", `WP ${s.wp_version}`));
+      node.lastChild.style.color = "var(--muted)";
+    } else if (status === "running") {
+      node.appendChild(el("span", "err", "scanning…"));
       node.lastChild.style.color = "var(--muted)";
     }
     wrap.appendChild(node);
   });
+}
+
+async function retryTarget(site) {
+  if (state.scanning) {
+    showToast("A scan is already running — wait for it to finish.", "warn");
+    return;
+  }
+  showToast(`Retrying ${host(site)}…`, "info");
+  try {
+    const res = await fetch("/api/scan", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ site }),
+    });
+    const data = await res.json();
+    if (!res.ok) { showToast(data.error || "Retry failed.", "error"); return; }
+    await load();   // picks up the running state and starts fast polling
+  } catch (e) {
+    showToast("Retry failed: " + e.message, "error");
+  }
 }
 
 function renderSiteFilter(sites) {

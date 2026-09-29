@@ -60,7 +60,8 @@ console immediately — no WPScan install or live targets needed.
 3. List your targets in `sites.txt` (one URL per line; `#` comments allowed).
 4. Start the app and click **Run scan**. Scans run in the background; the target
    chips turn green (success) or red (failed), and the table fills in as results
-   arrive. Progress appears as toast notifications in the bottom-right corner:
+   arrive. A failed target shows a **retry icon (↻)** — click it to rescan just
+   that one site without re-running the whole batch. Progress appears as toast notifications in the bottom-right corner:
    when a scan starts, as it moves to each target, whenever an API key is
    rotated, and a summary when the whole batch finishes. The header badge shows
    live progress (`Scanning… 2/3`).
