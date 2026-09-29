@@ -10,13 +10,18 @@ Routes:
   GET  /api/findings         all findings + summary + per-site scan status
   POST /api/scan             start a WPScan batch over SITES_FILE (background)
   POST /api/ingest-samples   load the bundled sample reports (no wpscan needed)
+  GET  /api/export.json      full audit report as JSON (download)
+  GET  /api/export.pdf       full audit report as PDF (download)
   POST /api/clear            wipe all stored scans and findings
 """
 
 from __future__ import annotations
 
-from flask import Flask, jsonify, render_template, request
+import json
 
+from flask import Flask, jsonify, make_response, render_template, request
+
+import report
 import scanner
 from config import CONFIG
 from db import Database
@@ -84,6 +89,31 @@ def api_ingest_samples():
     if count == 0:
         return jsonify({"error": f"No JSON reports found in {CONFIG['SAMPLE_DIR']}."}), 400
     return jsonify({"ingested": count})
+
+
+@app.route("/api/export.json")
+def api_export_json():
+    payload = report.build_report(db, CONFIG)
+    resp = make_response(json.dumps(payload, indent=2, sort_keys=False))
+    resp.headers["Content-Type"] = "application/json; charset=utf-8"
+    resp.headers["Content-Disposition"] = (
+        f'attachment; filename="{report.suggested_filename("json")}"')
+    return resp
+
+
+@app.route("/api/export.pdf")
+def api_export_pdf():
+    payload = report.build_report(db, CONFIG)
+    try:
+        pdf_bytes = report.build_pdf(payload)
+    except report.PdfUnavailable as exc:
+        # Degrade with an actionable message rather than a 500.
+        return jsonify({"error": str(exc)}), 501
+    resp = make_response(pdf_bytes)
+    resp.headers["Content-Type"] = "application/pdf"
+    resp.headers["Content-Disposition"] = (
+        f'attachment; filename="{report.suggested_filename("pdf")}"')
+    return resp
 
 
 @app.route("/api/clear", methods=["POST"])

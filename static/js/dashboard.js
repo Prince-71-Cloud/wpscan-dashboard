@@ -336,6 +336,50 @@ $("#btn-clear").addEventListener("click", () => {
   if (confirm("Clear all stored scans and findings?")) post("/api/clear");
 });
 
+/* ------------------------------ Export ------------------------------ */
+/* Downloads go through fetch rather than a plain link so a server-side
+ * failure (e.g. reportlab not installed) surfaces as a readable message
+ * instead of a browser error page. */
+async function download(url, kind) {
+  if (!state.findings.length && !state.sites.length) {
+    showToast("Nothing to export yet — run a scan or load sample data first.",
+              "warn");
+    return;
+  }
+  showToast(`Building ${kind} report…`, "info");
+  try {
+    const res = await fetch(url);
+    if (!res.ok) {
+      let msg = `${kind} export failed.`;
+      try { msg = (await res.json()).error || msg; } catch { /* non-JSON */ }
+      showToast(msg, "error");
+      return;
+    }
+    const blob = await res.blob();
+    // Prefer the filename the server chose (it carries the timestamp).
+    const disp = res.headers.get("Content-Disposition") || "";
+    const match = disp.match(/filename="?([^"]+)"?/);
+    const name = match ? match[1] : `wpscan-audit.${kind.toLowerCase()}`;
+
+    const href = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = href;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(href), 2000);
+    showToast(`${kind} report downloaded — ${name}`, "success");
+  } catch (e) {
+    showToast("Export failed: " + e.message, "error");
+  }
+}
+
+$("#btn-export-pdf").addEventListener("click",
+  () => download("/api/export.pdf", "PDF"));
+$("#btn-export-json").addEventListener("click",
+  () => download("/api/export.json", "JSON"));
+
 ["#search", "#filter-site", "#filter-type", "#sort"].forEach((sel) => {
   const node = $(sel);
   node.addEventListener(node.tagName === "SELECT" ? "change" : "input", render);

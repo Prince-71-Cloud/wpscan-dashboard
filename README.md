@@ -76,6 +76,29 @@ data**, or POST to `/api/ingest-samples`.
 
 ---
 
+## Exporting an audit report
+
+Two buttons in the header export whatever is currently stored:
+
+* **Export PDF** — a paginated audit report: severity summary with definitions,
+  a scope-and-coverage table (including targets that *failed* to scan, flagged
+  explicitly so a coverage gap is never mistaken for a clean result), and the
+  findings table ordered by severity with critical/high rows tinted. Suitable
+  for handing to a client or attaching to a ticket.
+* **Export JSON** — the same report as structured data (`report_type`,
+  `generated_at`, `scope`, `summary`, `targets`, `findings`,
+  `severity_definitions`, `notes`), for diffing between runs or feeding into
+  another tool.
+
+Files are named `wpscan-audit-YYYYMMDD-HHMM.{pdf,json}`. The equivalent
+endpoints are `GET /api/export.pdf` and `GET /api/export.json`.
+
+PDF export needs `reportlab` (included in `requirements.txt`). If it isn't
+installed the dashboard still runs and JSON export still works — the PDF button
+reports that reportlab is missing instead of failing silently.
+
+---
+
 ## Configuration
 
 All settings are environment variables (see `config.py`):
@@ -133,6 +156,8 @@ site replaces its findings so nothing goes stale.
 | GET | `/api/findings` | All findings + severity summary + per-site status |
 | POST | `/api/scan` | Start a WPScan batch over `sites.txt` (background) |
 | POST | `/api/ingest-samples` | Load JSON reports from `SAMPLE_DIR` |
+| GET | `/api/export.json` | Full audit report as JSON (download) |
+| GET | `/api/export.pdf` | Full audit report as PDF (download) |
 | POST | `/api/clear` | Wipe stored scans and findings |
 
 ## Deployment note
