@@ -442,6 +442,66 @@ $("#btn-clear").addEventListener("click", () => {
   if (confirm("Clear all stored scans and findings?")) post("/api/clear");
 });
 
+/* ----------------------------- Settings ----------------------------- */
+function fmtTimeout(s) {
+  const v = Number(s);
+  if (v < 60)  return `${v}s`;
+  if (v < 3600) return `${Math.round(v/60)}m`;
+  return `${(v/3600).toFixed(1)}h`;
+}
+
+async function openSettings() {
+  try {
+    const r = await fetch("/api/settings");
+    const cfg = await r.json();
+    $("#s-preflight").checked      = cfg.PREFLIGHT_CHECK !== "false";
+    $("#s-preflight-timeout").value = cfg.PREFLIGHT_TIMEOUT ?? 10;
+    $("#s-timeout").value           = cfg.SCAN_TIMEOUT ?? 1800;
+    $("#s-timeout-val").textContent = fmtTimeout(cfg.SCAN_TIMEOUT ?? 1800);
+    $("#s-detection").value         = cfg.WPSCAN_PLUGINS_DETECTION ?? "aggressive";
+    $("#s-enumerate").value         = cfg.WPSCAN_ENUMERATE ?? "vp,vt,u,cb,dbe";
+    $("#s-concurrent").value        = cfg.MAX_CONCURRENT ?? 3;
+  } catch { /* use whatever values are already in the inputs */ }
+  $("#settings-panel").hidden = false;
+  $("#btn-settings").setAttribute("aria-pressed", "true");
+}
+
+function closeSettings() {
+  $("#settings-panel").hidden = true;
+  $("#btn-settings").setAttribute("aria-pressed", "false");
+  $("#settings-status").textContent = "";
+}
+
+$("#btn-settings").addEventListener("click", openSettings);
+$("#settings-close").addEventListener("click", closeSettings);
+$("#settings-panel .settings-backdrop").addEventListener("click", closeSettings);
+
+$("#s-timeout").addEventListener("input", (e) => {
+  $("#s-timeout-val").textContent = fmtTimeout(e.target.value);
+});
+
+$("#settings-save").addEventListener("click", async () => {
+  const body = {
+    SCAN_TIMEOUT:          Number($("#s-timeout").value),
+    PREFLIGHT_CHECK:       $("#s-preflight").checked ? "true" : "false",
+    PREFLIGHT_TIMEOUT:     Number($("#s-preflight-timeout").value),
+    WPSCAN_PLUGINS_DETECTION: $("#s-detection").value,
+    WPSCAN_ENUMERATE:      $("#s-enumerate").value.trim(),
+    MAX_CONCURRENT:        Number($("#s-concurrent").value),
+  };
+  try {
+    const r = await fetch("/api/settings", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(body),
+    });
+    const d = await r.json();
+    if (d.saved) {
+      $("#settings-status").textContent = "✓ Saved";
+      setTimeout(() => { $("#settings-status").textContent = ""; }, 2500);
+    }
+  } catch { $("#settings-status").textContent = "Save failed"; }
+});
+
 /* ------------------------------ Export ------------------------------ */
 /* Downloads go through fetch rather than a plain link so a server-side
  * failure (e.g. reportlab not installed) surfaces as a readable message

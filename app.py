@@ -101,6 +101,31 @@ def api_ingest_samples():
     return jsonify({"ingested": count})
 
 
+@app.route("/api/settings", methods=["GET", "POST"])
+def api_settings():
+    """Read or update runtime scan settings without restarting the server."""
+    editable = {
+        "SCAN_TIMEOUT": int,
+        "PREFLIGHT_CHECK": str,
+        "PREFLIGHT_TIMEOUT": int,
+        "WPSCAN_ENUMERATE": str,
+        "WPSCAN_PLUGINS_DETECTION": str,
+        "MAX_CONCURRENT": int,
+        "EXTRA_CHECKS": str,
+        "WPSCAN_FORMAT": str,
+    }
+    if request.method == "POST":
+        body = request.get_json(silent=True) or {}
+        for key, cast in editable.items():
+            if key in body:
+                try:
+                    CONFIG[key] = cast(body[key])
+                except (ValueError, TypeError):
+                    pass
+        return jsonify({"saved": True, "settings": {k: CONFIG[k] for k in editable}})
+    return jsonify({k: CONFIG[k] for k in editable})
+
+
 @app.route("/api/scan-log")
 def api_scan_log():
     """Live verbose scan output for the console panel. Display-only — these

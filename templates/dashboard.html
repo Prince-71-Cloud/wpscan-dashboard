@@ -19,6 +19,7 @@
       <span id="scan-state" class="scan-state" hidden></span>
       <button id="btn-scan" class="btn btn-primary">Run scan</button>
       <button id="btn-samples" class="btn">Load sample data</button>
+      <button id="btn-settings" class="btn" aria-pressed="false" title="Scan settings">⚙ Settings</button>
       <button id="btn-console" class="btn" aria-pressed="false">Scan output</button>
       <button id="btn-export-pdf" class="btn">Export PDF</button>
       <button id="btn-export-json" class="btn">Export JSON</button>
@@ -93,6 +94,75 @@
       </div>
     </section>
   </main>
+
+  <!-- Scan settings panel -->
+  <div id="settings-panel" class="settings-panel" hidden role="dialog" aria-label="Scan settings">
+    <div class="settings-backdrop"></div>
+    <div class="settings-box">
+      <div class="settings-header">
+        <span class="settings-title">⚙ Scan settings</span>
+        <button id="settings-close" class="settings-close" aria-label="Close">×</button>
+      </div>
+
+      <div class="settings-body">
+        <div class="setting-row">
+          <label for="s-preflight">Pre-flight site check</label>
+          <div class="setting-control">
+            <input type="checkbox" id="s-preflight" class="toggle">
+            <span class="setting-hint">Test reachability &amp; WordPress before spending API quota</span>
+          </div>
+        </div>
+
+        <div class="setting-row">
+          <label for="s-preflight-timeout">Pre-flight timeout (s)</label>
+          <div class="setting-control">
+            <input type="number" id="s-preflight-timeout" class="num-input" min="3" max="30" step="1">
+            <span class="setting-hint">How long to wait for the site check</span>
+          </div>
+        </div>
+
+        <div class="setting-row">
+          <label for="s-timeout">Scan timeout (s)</label>
+          <div class="setting-control inline">
+            <input type="range" id="s-timeout" min="60" max="7200" step="60">
+            <output id="s-timeout-val" class="range-val"></output>
+          </div>
+          <span class="setting-hint full">Time before WPScan is killed. Aggressive detection on large sites can take 20–40 min.</span>
+        </div>
+
+        <div class="setting-row">
+          <label for="s-detection">Plugin detection</label>
+          <div class="setting-control">
+            <select id="s-detection" class="setting-select">
+              <option value="aggressive">Aggressive — thorough, slow</option>
+              <option value="mixed">Mixed — balanced</option>
+              <option value="passive">Passive — fast, less complete</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="setting-row">
+          <label for="s-enumerate">Enumeration flags</label>
+          <div class="setting-control">
+            <input type="text" id="s-enumerate" class="text-input" placeholder="vp,vt,u,cb,dbe">
+            <span class="setting-hint">WPScan --enumerate value</span>
+          </div>
+        </div>
+
+        <div class="setting-row">
+          <label for="s-concurrent">Max concurrent scans</label>
+          <div class="setting-control">
+            <input type="number" id="s-concurrent" class="num-input" min="1" max="10" step="1">
+          </div>
+        </div>
+      </div>
+
+      <div class="settings-footer">
+        <span id="settings-status" class="settings-status"></span>
+        <button id="settings-save" class="btn btn-primary">Save</button>
+      </div>
+    </div>
+  </div>
 
   <!-- Live verbose scan console (display-only; never exported). Toggled by the
        "Scan output" button. -->

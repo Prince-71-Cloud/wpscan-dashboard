@@ -107,9 +107,12 @@ def run_passive_checks(
     parsed = urlparse(base)
     findings: list[dict[str, Any]] = []
     budget = {"n": 0}
+    # Hard wall-clock cap so a slow/blocked host can't stall the whole batch:
+    # at most max_requests requests, but also stop after this many seconds.
+    deadline = time.monotonic() + min(timeout * 4, 90)
 
     def request(path: str, method: str = "GET"):
-        if budget["n"] >= max_requests:
+        if budget["n"] >= max_requests or time.monotonic() > deadline:
             return None
         budget["n"] += 1
         time.sleep(delay)

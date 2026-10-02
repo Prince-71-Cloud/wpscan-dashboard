@@ -25,9 +25,12 @@ import json
 import os
 import re
 import signal
+import socket
+import ssl
 import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import urlparse
 from typing import Any, Callable
 
 import parser as report_parser
@@ -225,6 +228,89 @@ def read_api_keys(path: str) -> list[str]:
     return keys
 
 
+def preflight_check(url: str, timeout: int = 10) -> tuple[bool, str]:
+    """Quick check before spending an API key on WPScan.
+
+    Returns (ok: bool, reason: str).
+    ok=True means the site is reachable and looks like WordPress.
+    ok=False means we should skip WPScan entirely — reason explains why.
+
+    Checks (in order, each under `timeout` seconds):
+      1. TCP connect to port 80/443 — is the host reachable at all?
+      2. HTTP HEAD to the URL — does it return any response (even a 4xx)?
+      3. WordPress fingerprint — is /wp-login.php or /wp-json/ accessible,
+         or does the homepage contain WordPress signals?
+
+    We deliberately do NOT check for 200 OK on the homepage — a site behind
+    Cloudflare or with a WAF may return 403/503 to scanners but still be
+    reachable and WordPress. We also do NOT follow too many redirects, because
+    a site that redirects forever is itself a signal of misconfiguration.
+    """
+    import http.client
+    import urllib.request as _req
+    import urllib.error as _err
+
+    parsed = urlparse(url if "://" in url else "https://" + url)
+    host = parsed.hostname or ""
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+
+    # 1. TCP reachability — fastest gate, no HTTP overhead.
+    try:
+        sock = socket.create_connection((host, port), timeout=timeout)
+        sock.close()
+    except (socket.timeout, OSError) as exc:
+        return False, f"Host unreachable ({host}:{port}): {exc}"
+
+    # 2. HTTP response — any response means the web server is alive.
+    headers = {"User-Agent": _UA}
+    status = None
+    try:
+        req = _req.Request(url, method="HEAD", headers=headers)
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        with _req.urlopen(req, timeout=timeout, context=ctx) as resp:
+            status = resp.status
+    except _err.HTTPError as e:
+        status = e.code  # 4xx/5xx still means the server responded
+    except (_err.URLError, ssl.SSLError, socket.timeout, OSError) as exc:
+        return False, f"HTTP request failed: {exc}"
+
+    # A 301/302 to a completely different domain (e.g. parked) is worth noting
+    # but we still proceed — WPScan can follow redirects itself.
+
+    # 3. WordPress fingerprint — check two lightweight paths.
+    #    /wp-login.php almost always returns 200 on a live WP site.
+    #    /wp-json/ returns JSON on WP 4.4+.
+    wp_found = False
+    for path in ("/wp-login.php", "/wp-json/"):
+        try:
+            req2 = _req.Request(url.rstrip("/") + path, method="GET",
+                                headers=headers)
+            ctx2 = ssl.create_default_context()
+            ctx2.check_hostname = False
+            ctx2.verify_mode = ssl.CERT_NONE
+            with _req.urlopen(req2, timeout=timeout, context=ctx2) as resp2:
+                body = resp2.read(2048)
+                if (b"wp-" in body or b"WordPress" in body
+                        or b"rest_url" in body or resp2.status < 400):
+                    wp_found = True
+                    break
+        except _err.HTTPError as e:
+            if e.code in (200, 301, 302, 401, 403):
+                wp_found = True  # WP auth gate still means WP is there
+                break
+        except Exception:  # noqa: BLE001
+            pass
+
+    if not wp_found:
+        return False, (f"Site is reachable (HTTP {status}) but no WordPress "
+                       f"fingerprint found (/wp-login.php, /wp-json/). "
+                       f"May not be WordPress — skipping to save API quota.")
+
+    return True, f"OK (HTTP {status}, WordPress detected)"
+
+
 def _truthy(val: Any) -> bool:
     if isinstance(val, bool):
         return val
@@ -257,6 +343,8 @@ def build_keyring(config: dict[str, Any]) -> KeyRing:
 
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 
 
 def _strip_ansi(text: str) -> str:
@@ -400,27 +488,31 @@ def run_wpscan(
     extra_args: list[str] | None = None,
     on_output: "Callable[[str], None] | None" = None,
     verbose: bool = True,
+    fmt: str = "cli-no-colour",
 ) -> dict[str, Any]:
-    """Run WPScan against one URL and return the parsed JSON report.
+    """Run WPScan against one URL and return a structured report
+    ({site, wp_version, target_ip, findings}).
 
-    The enumeration flags are what make the scan *thorough* rather than fast and
-    shallow. Defaults mirror a typical audit invocation:
-      vp = vulnerable plugins, vt = vulnerable themes, u = users,
-      cb = config backups, dbe = db exports.
-    `plugins_detection=aggressive` probes for plugins by requesting known paths
-    instead of only reading what the homepage advertises — far more complete,
-    but slower and noisier, so it is configurable.
+    Output format matters a lot here:
+      * cli-no-colour (default) streams human-readable progress live, which is
+        what powers the live console. Findings are recovered from that text by
+        cli_parser, preserving the structured table.
+      * json runs SILENTLY (WPScan emits nothing until the end), so the console
+        stays empty, but the report is natively structured. Use it only if you
+        don't need the live console.
 
-    If `on_output` is given, WPScan's live progress (its stderr stream) is fed to
-    it line by line as the scan runs, for a verbose console view. The JSON report
-    still comes from stdout and is returned as before. This live output is purely
-    for display — it is never stored or included in exported reports.
+    The enumeration flags make the scan thorough rather than fast and shallow:
+    vp = vulnerable plugins, vt = vulnerable themes, u = users, cb = config
+    backups, dbe = db exports; plugins_detection=aggressive probes known paths.
+
+    `on_output`, if given, receives each live progress line for the console.
+    This live output is purely for display — never stored or exported.
     """
-    cmd = [wpscan_path, "--url", url, "--format", "json", "--no-banner",
+    is_json = fmt == "json"
+    cmd = [wpscan_path, "--url", url, "--format", fmt, "--no-banner",
            "--random-user-agent"]
-    # --verbose makes WPScan emit live progress on stderr; without it, json
-    # output is silent until the scan ends and the console stays empty.
-    if verbose and on_output:
+    # --verbose enriches the live progress; only meaningful for cli formats.
+    if verbose and on_output and not is_json:
         cmd += ["--verbose"]
     if enumerate:
         cmd += ["--enumerate", enumerate]
@@ -466,40 +558,62 @@ def run_wpscan(
             f"WPSCAN_PLUGINS_DETECTION=mixed (or passive) for a faster scan."
         )
 
-    # Try to parse stdout regardless of exit code.
-    report = _first_json(stdout_data)
-    if report is not None:
-        # WPScan puts its own errors inside "scan_aborted" when it can't proceed.
-        if report.get("scan_aborted"):
-            detail = str(report["scan_aborted"])
-            if _looks_like_rate_limit(detail):
-                raise RateLimitError(f"{url}: {detail}")
-            if _looks_like_invalid_key(detail):
-                raise InvalidKeyError(f"{url}: {detail}")
-            raise WPScanError(f"{url}: {detail}")
+    # ---- JSON format: parse the JSON report via parser.parse_report --------
+    if is_json:
+        report = _first_json(stdout_data)
+        if report is not None:
+            if report.get("scan_aborted"):
+                detail = str(report["scan_aborted"])
+                if _looks_like_rate_limit(detail):
+                    raise RateLimitError(f"{url}: {detail}")
+                if _looks_like_invalid_key(detail):
+                    raise InvalidKeyError(f"{url}: {detail}")
+                raise WPScanError(f"{url}: {detail}")
+            api_problem = _api_problem_in_report(report)
+            if api_problem:
+                if _looks_like_rate_limit(api_problem):
+                    raise RateLimitError(f"{url}: {api_problem}")
+                if _looks_like_invalid_key(api_problem):
+                    raise InvalidKeyError(f"{url}: {api_problem}")
+                raise WPScanError(f"{url}: vuln API error: {api_problem}")
+            parsed_json = report_parser.parse_report(report, site_hint=url)
+            rem = _requests_remaining(report)
+            if rem is not None:
+                parsed_json["requests_remaining"] = rem
+            return parsed_json
+        detail = _extract_error_detail(stderr_text) or f"exit code {returncode}"
+        if _looks_like_rate_limit(detail):
+            raise RateLimitError(f"{url}: {detail[:600]}")
+        if _looks_like_invalid_key(detail):
+            raise InvalidKeyError(f"{url}: {detail[:600]}")
+        raise WPScanError(f"WPScan produced no report for {url}: {detail[:600]}")
 
-        # A report can come back "successful" while the vulnerability API was
-        # refusing the key the whole time — the scan then contains enumeration
-        # data but no vuln data. Treat that as a key problem so the caller can
-        # rotate and re-scan, rather than silently storing an incomplete result.
-        api_problem = _api_problem_in_report(report)
-        if api_problem:
-            if _looks_like_rate_limit(api_problem):
-                raise RateLimitError(f"{url}: {api_problem}")
-            if _looks_like_invalid_key(api_problem):
-                raise InvalidKeyError(f"{url}: {api_problem}")
-            raise WPScanError(f"{url}: vuln API error: {api_problem}")
-        return report
+    # ---- CLI format: detect failures in the text, else parse with cli_parser
+    plain = _strip_ansi(stdout_data)
+    # WPScan reports fatal problems as "Scan Aborted: ..." in cli mode.
+    abort = re.search(r"Scan Aborted:\s*(.+)", plain)
+    if abort:
+        detail = abort.group(1).strip()
+        if _looks_like_rate_limit(detail):
+            raise RateLimitError(f"{url}: {detail}")
+        if _looks_like_invalid_key(detail):
+            raise InvalidKeyError(f"{url}: {detail}")
+        raise WPScanError(f"{url}: Scan Aborted: {detail}")
+    if _looks_like_rate_limit(plain) and "vulns" not in plain.lower():
+        raise RateLimitError(f"{url}: {_extract_error_detail(plain)[:600]}")
+    if _looks_like_invalid_key(plain):
+        raise InvalidKeyError(f"{url}: {_extract_error_detail(plain)[:600]}")
 
-    # No JSON -> surface the most useful error text we can find. Pull out lines
-    # that look like errors rather than dumping raw progress, so the "scan
-    # failed" reason shown in the UI is actually meaningful.
-    detail = _extract_error_detail(stderr_text) or f"exit code {returncode}"
-    if _looks_like_rate_limit(detail):
-        raise RateLimitError(f"{url}: {detail[:600]}")
-    if _looks_like_invalid_key(detail):
-        raise InvalidKeyError(f"{url}: {detail[:600]}")
-    raise WPScanError(f"WPScan produced no report for {url}: {detail[:600]}")
+    import cli_parser
+    parsed = cli_parser.parse_cli(plain, site_hint=url)
+    # A completely empty parse usually means the scan never really ran (host
+    # down, blocked). Treat that as a failure with whatever detail we can find.
+    if not parsed["findings"] and "Interesting Finding" not in plain \
+            and "WordPress" not in plain:
+        detail = _extract_error_detail(plain) or f"exit code {returncode}"
+        raise WPScanError(f"WPScan produced no usable output for {url}: "
+                          f"{detail[:600]}")
+    return parsed
 
 
 def _extract_error_detail(text: str) -> str:
@@ -811,9 +925,29 @@ class ScanManager:
     def _scan_one(self, site: str, scan_id: int, index: int = 1, total: int = 1) -> None:
         import time
         keyring = self._keyring
-        # Claim a key round-robin so each site in the batch uses a different key
-        # and the daily quota is spread across every key in the file.
-        key = keyring.lease()
+
+        # --- Pre-flight: check the site is reachable and looks like WordPress
+        # before spending any API quota on WPScan. ---
+        preflight_timeout = int(self.config.get("PREFLIGHT_TIMEOUT", 10))
+        if _truthy(self.config.get("PREFLIGHT_CHECK", True)):
+            self.log.append(site, f"[~] Pre-flight check: {site}")
+            ok, reason = preflight_check(site, timeout=preflight_timeout)
+            self.log.append(site, f"[{'i' if ok else '!'}] {reason}")
+            if not ok:
+                self.db.update_scan(scan_id, status="error",
+                                    finished_at=time.time(), error=reason)
+                self.events.emit(
+                    "target_done",
+                    f"[{index}/{total}] {site} skipped — {reason}",
+                    level="warn",
+                )
+                self._mark_done()
+                return
+
+        # Use the current key for all sites; only rotate when a key is actually
+        # rejected or rate-limited (KeyProblem). This preserves quota — burning
+        # a fresh key per site wastes 25 requests just in the API handshake.
+        key = keyring.current()
         self.events.emit(
             "target_start",
             f"[{index}/{total}] Scanning {site}"
@@ -826,7 +960,10 @@ class ScanManager:
 
         for _ in range(attempts):
             try:
-                report = run_wpscan(
+                # run_wpscan returns an already-parsed report (cli_parser for
+                # cli formats, parser.parse_report for json), so the findings
+                # pipeline is identical regardless of format.
+                parsed = run_wpscan(
                     site,
                     wpscan_path=self.config.get("WPSCAN_PATH", "wpscan"),
                     api_token=key,
@@ -837,8 +974,8 @@ class ScanManager:
                     extra_args=_split_args(self.config.get("WPSCAN_EXTRA_ARGS")),
                     on_output=lambda line, s=site: self.log.append(s, line),
                     verbose=_truthy(self.config.get("WPSCAN_VERBOSE", True)),
+                    fmt=self.config.get("WPSCAN_FORMAT", "cli-no-colour"),
                 )
-                parsed = report_parser.parse_report(report, site_hint=site)
                 wp_findings = parsed["findings"]
 
                 # Add passive web-hygiene checks (headers, CORS, TLS, exposed
@@ -874,7 +1011,9 @@ class ScanManager:
                 self._mark_done()
                 # Scan succeeded, but if that used up the key's quota, retire it
                 # now so the next site doesn't waste an attempt discovering it.
-                remaining = _requests_remaining(report)
+                # (Only available from the JSON format; None for cli, which just
+                # relies on reactive rotation when a key next rate-limits.)
+                remaining = parsed.get("requests_remaining")
                 if key and remaining is not None and remaining <= 0:
                     keyring.report_exhausted(key)
                     self.events.emit(
