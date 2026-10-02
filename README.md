@@ -201,6 +201,28 @@ site replaces its findings so nothing goes stale.
 | GET | `/api/export.pdf` | Full audit report as PDF (download) |
 | POST | `/api/clear` | Wipe stored scans and findings |
 
+## Troubleshooting
+
+**A target shows "scan failed".** Click the "scan failed" text on the target
+chip to see the exact error, or run `python show_errors.py` to print the stored
+error for every failed target.
+
+**Scan fails after a long wait (timeout).** Aggressive plugin detection
+(`--plugins-detection aggressive`, the default) probes thousands of plugin paths
+and, on a large or distant site (e.g. a big WooCommerce store behind a CDN), can
+exceed the scan timeout. Options, fastest first:
+* `WPSCAN_PLUGINS_DETECTION=mixed` — much faster, still finds most plugins.
+* `WPSCAN_PLUGINS_DETECTION=passive` — fastest, only plugins advertised on the page.
+* Raise `SCAN_TIMEOUT` (default 1800s) to give aggressive detection more time.
+* Add throttling if the site is rate-limiting/blocking you, e.g.
+  `WPSCAN_EXTRA_ARGS="--throttle 500 --max-threads 5"`.
+
+**Every scan fails instantly.** Usually WPScan isn't installed
+(`gem install wpscan`) or isn't on `PATH`; the error text will say so. A WAF or
+Cloudflare may also block the scan outright — check the stored error.
+
+---
+
 ## Deployment note
 
 `app.py` uses Flask's development server, which is fine for local single-user

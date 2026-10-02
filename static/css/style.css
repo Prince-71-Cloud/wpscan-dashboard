@@ -372,3 +372,7 @@ table.findings { width: 100%; border-collapse: collapse; min-width: 900px; }
   outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
+
+/* Clickable "scan failed" label reveals the stored error */
+.target .err-link { cursor: pointer; text-decoration: underline dotted; text-underline-offset: 2px; }
+.target .err-link:hover { color: #ff8793; }

@@ -17,7 +17,7 @@ without code changes.
                      rotated when a key hits its daily limit
   SITES_FILE         list of target site URLs, one per line    (default: sites.txt)
   DATABASE           SQLite file path                          (default: dashboard.db)
-  SCAN_TIMEOUT       per-site scan timeout in seconds          (default: 600)
+  SCAN_TIMEOUT       per-site scan timeout in seconds          (default: 1800)
   MAX_CONCURRENT     parallel scans per batch                  (default: 3)
   SAMPLE_DIR         directory of sample WPScan JSON reports    (default: sample_scans)
   HOST / PORT        bind address                              (default: 127.0.0.1:5000)
@@ -44,7 +44,7 @@ CONFIG = {
     "API_KEYS_FILE":    os.environ.get("API_KEYS_FILE", "api_keys.txt"),
     "SITES_FILE":       os.environ.get("SITES_FILE", "sites.txt"),
     "DATABASE":         os.environ.get("DATABASE", "dashboard.db"),
-    "SCAN_TIMEOUT":     _int("SCAN_TIMEOUT", 600),
+    "SCAN_TIMEOUT":     _int("SCAN_TIMEOUT", 1800),
     "MAX_CONCURRENT":   _int("MAX_CONCURRENT", 3),
     "SAMPLE_DIR":       os.environ.get("SAMPLE_DIR", "sample_scans"),
     "HOST":             os.environ.get("HOST", "127.0.0.1"),

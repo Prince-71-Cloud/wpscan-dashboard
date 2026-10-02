@@ -166,8 +166,13 @@ function renderTargets(sites) {
     node.appendChild(el("span", "dot"));
     node.appendChild(el("span", "host", host(s.site)));
     if (status === "error" && s.error) {
-      const e = el("span", "err", "scan failed");
-      e.title = s.error;
+      const e = el("span", "err err-link", "scan failed");
+      e.title = "Click to see why";
+      // The failure reason is stored but easy to miss — surface it on click.
+      e.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        showToast(`${host(s.site)} — ${s.error}`, "error");
+      });
       node.appendChild(e);
       // Retry just this target (a batch of one) without re-running everything.
       const retry = el("button", "retry", "↻");

@@ -294,7 +294,12 @@ def run_wpscan(
             f"or ingest existing JSON reports instead."
         ) from exc
     except subprocess.TimeoutExpired as exc:
-        raise WPScanError(f"Scan of {url} timed out after {timeout}s") from exc
+        raise WPScanError(
+            f"Scan of {url} timed out after {timeout}s. Aggressive plugin "
+            f"detection probes thousands of paths and can exceed this on large "
+            f"or slow sites. Raise SCAN_TIMEOUT, or set "
+            f"WPSCAN_PLUGINS_DETECTION=mixed (or passive) for a faster scan."
+        ) from exc
 
     # Try to parse stdout regardless of exit code.
     report = _first_json(proc.stdout)
