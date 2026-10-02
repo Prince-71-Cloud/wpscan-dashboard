@@ -264,6 +264,7 @@ def run_wpscan(
     plugins_detection: str | None = "aggressive",
     extra_args: list[str] | None = None,
     on_output: "Callable[[str], None] | None" = None,
+    verbose: bool = True,
 ) -> dict[str, Any]:
     """Run WPScan against one URL and return the parsed JSON report.
 
@@ -282,6 +283,10 @@ def run_wpscan(
     """
     cmd = [wpscan_path, "--url", url, "--format", "json", "--no-banner",
            "--random-user-agent"]
+    # --verbose makes WPScan emit live progress on stderr; without it, json
+    # output is silent until the scan ends and the console stays empty.
+    if verbose and on_output:
+        cmd += ["--verbose"]
     if enumerate:
         cmd += ["--enumerate", enumerate]
     if plugins_detection:
@@ -309,26 +314,33 @@ def run_wpscan(
             f"or ingest existing JSON reports instead."
         ) from exc
 
-    # WPScan writes the JSON report to stdout and human-readable progress to
-    # stderr. Drain stderr on a side thread so progress reaches the console live
-    # while the main thread reads the (potentially large) JSON from stdout.
+    # Where WPScan writes progress depends on version and flags: usually the
+    # JSON report is on stdout and progress on stderr, but with --verbose the
+    # progress can land on stdout interleaved with the JSON. So drain BOTH pipes
+    # live on side threads: accumulate everything for parsing, and forward only
+    # display-worthy lines (not the raw JSON blob) to the console.
+    stdout_chunks: list[str] = []
     stderr_lines: list[str] = []
 
-    def _drain_stderr() -> None:
+    def _drain(pipe, sink: list[str]) -> None:
         try:
-            for line in proc.stderr:  # type: ignore[union-attr]
-                line = line.rstrip("\n")
-                stderr_lines.append(line)
-                if on_output and line.strip():
-                    on_output(line)
+            for line in pipe:
+                sink.append(line)
+                if on_output:
+                    text = line.rstrip("\n")
+                    if _is_displayable(text):
+                        on_output(text)
         except (ValueError, OSError):
             pass  # pipe closed when the process is killed
 
-    drainer = threading.Thread(target=_drain_stderr, daemon=True)
-    drainer.start()
+    t_out = threading.Thread(target=_drain, args=(proc.stdout, stdout_chunks),
+                             daemon=True)
+    t_err = threading.Thread(target=_drain, args=(proc.stderr, stderr_lines),
+                             daemon=True)
+    t_out.start()
+    t_err.start()
 
-    # Kill the process if it overruns the timeout; stdout.read() blocks until the
-    # process exits (or is killed), which is simpler than a select loop.
+    # Kill the process if it overruns the timeout.
     timed_out = {"v": False}
 
     def _kill() -> None:
@@ -346,11 +358,14 @@ def run_wpscan(
     timer = threading.Timer(max(1, timeout), _kill)
     timer.start()
     try:
-        stdout_data = proc.stdout.read() if proc.stdout else ""
-        proc.wait()
+        proc.wait(timeout=timeout + 5)
+    except subprocess.TimeoutExpired:
+        _kill()
     finally:
         timer.cancel()
-        drainer.join(timeout=2)
+        t_out.join(timeout=3)
+        t_err.join(timeout=3)
+    stdout_data = "".join(stdout_chunks)
 
     if timed_out["v"]:
         if on_output:
@@ -400,6 +415,26 @@ def run_wpscan(
     raise WPScanError(f"WPScan produced no report for {url}: {detail[:500]}")
 
 
+def _is_displayable(line: str) -> bool:
+    """True if a raw output line should appear in the live console.
+
+    Filters out the JSON report itself (which may arrive on stdout, possibly as
+    one very long line or pretty-printed) so the console shows human-readable
+    progress rather than a wall of JSON. Blank lines are dropped too."""
+    s = line.strip()
+    if not s:
+        return False
+    # WPScan's human progress lines start with [i] [+] [!] [e] — always keep.
+    if len(s) >= 3 and s[0] == "[" and s[2] == "]":
+        return True
+    # Otherwise treat JSON (report body, pretty-printed or inline) as noise.
+    if s[0] in "{}[" or s.startswith('"') or s.startswith("],") or s == "]":
+        return False
+    if len(s) > 400:
+        return False
+    return True
+
+
 def _redacted_cmd(cmd: list[str]) -> str:
     """Render the command for display with the API token masked."""
     out = []
@@ -417,20 +452,47 @@ def _redacted_cmd(cmd: list[str]) -> str:
 
 
 def _first_json(text: str) -> dict[str, Any] | None:
-    """WPScan is usually clean JSON, but be tolerant of leading warnings."""
+    """Extract the WPScan JSON report from stdout.
+
+    Usually stdout is clean JSON, but with --verbose WPScan can interleave
+    progress text before and/or after the report, so this finds the first
+    balanced top-level {...} object and parses that, rather than assuming the
+    JSON is the whole stream."""
     if not text:
         return None
-    text = text.strip()
+    stripped = text.strip()
     try:
-        return json.loads(text)
+        return json.loads(stripped)
     except json.JSONDecodeError:
         pass
-    start = text.find("{")
-    if start > 0:
-        try:
-            return json.loads(text[start:])
-        except json.JSONDecodeError:
-            return None
+    # Walk braces to find a complete top-level object anywhere in the text.
+    start = stripped.find("{")
+    while start != -1:
+        depth = 0
+        in_str = False
+        esc = False
+        for i in range(start, len(stripped)):
+            ch = stripped[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+            elif ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = stripped[start:i + 1]
+                    try:
+                        return json.loads(candidate)
+                    except json.JSONDecodeError:
+                        break  # not valid; try the next '{'
+        start = stripped.find("{", start + 1)
     return None
 
 
@@ -664,6 +726,7 @@ class ScanManager:
                         "WPSCAN_PLUGINS_DETECTION", "aggressive"),
                     extra_args=_split_args(self.config.get("WPSCAN_EXTRA_ARGS")),
                     on_output=lambda line, s=site: self.log.append(s, line),
+                    verbose=_truthy(self.config.get("WPSCAN_VERBOSE", True)),
                 )
                 parsed = report_parser.parse_report(report, site_hint=site)
                 wp_findings = parsed["findings"]

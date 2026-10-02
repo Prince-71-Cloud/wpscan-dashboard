@@ -120,6 +120,12 @@ being run (with the API token masked), each enumeration phase, plugins/themes as
 they're found, and any warnings. It polls while open, auto-scrolls unless you
 scroll up to read, and has `wrap` / `clear` controls.
 
+The console relies on WPScan's `--verbose` flag (added automatically) to emit
+live progress — without it, `--format json` scans run silently and the panel
+stays empty until the end. The raw JSON report is filtered out of the view so
+you see human-readable progress (`[i] Enumerating…`, `[+] plugin`, `[!] vuln`)
+rather than a wall of JSON. Disable with `WPSCAN_VERBOSE=false`.
+
 This console is **display-only**: the verbose output is held in memory for the
 current session, is never written to the database, and is deliberately excluded
 from exported reports. It is also hidden when you print the page, so a printed
