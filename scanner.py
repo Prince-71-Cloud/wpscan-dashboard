@@ -23,10 +23,11 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any
+from typing import Any, Callable
 
 import parser as report_parser
 from db import Database
@@ -262,6 +263,7 @@ def run_wpscan(
     enumerate: str | None = "vp,vt,u,cb,dbe",
     plugins_detection: str | None = "aggressive",
     extra_args: list[str] | None = None,
+    on_output: "Callable[[str], None] | None" = None,
 ) -> dict[str, Any]:
     """Run WPScan against one URL and return the parsed JSON report.
 
@@ -272,6 +274,11 @@ def run_wpscan(
     `plugins_detection=aggressive` probes for plugins by requesting known paths
     instead of only reading what the homepage advertises — far more complete,
     but slower and noisier, so it is configurable.
+
+    If `on_output` is given, WPScan's live progress (its stderr stream) is fed to
+    it line by line as the scan runs, for a verbose console view. The JSON report
+    still comes from stdout and is returned as before. This live output is purely
+    for display — it is never stored or included in exported reports.
     """
     cmd = [wpscan_path, "--url", url, "--format", "json", "--no-banner",
            "--random-user-agent"]
@@ -284,25 +291,82 @@ def run_wpscan(
     if extra_args:
         cmd += extra_args
 
+    if on_output:
+        on_output(f"$ {_redacted_cmd(cmd)}")
+
     try:
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout, check=False
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            bufsize=1,
+            # Own process group so a timeout can kill wpscan *and* its children
+            # (ruby spawns helpers); killing only the parent leaves children
+            # holding the output pipe open, so read() would block until they end.
+            start_new_session=True,
         )
     except FileNotFoundError as exc:
         raise WPScanError(
             f"'{wpscan_path}' not found. Install WPScan (gem install wpscan) "
             f"or ingest existing JSON reports instead."
         ) from exc
-    except subprocess.TimeoutExpired as exc:
+
+    # WPScan writes the JSON report to stdout and human-readable progress to
+    # stderr. Drain stderr on a side thread so progress reaches the console live
+    # while the main thread reads the (potentially large) JSON from stdout.
+    stderr_lines: list[str] = []
+
+    def _drain_stderr() -> None:
+        try:
+            for line in proc.stderr:  # type: ignore[union-attr]
+                line = line.rstrip("\n")
+                stderr_lines.append(line)
+                if on_output and line.strip():
+                    on_output(line)
+        except (ValueError, OSError):
+            pass  # pipe closed when the process is killed
+
+    drainer = threading.Thread(target=_drain_stderr, daemon=True)
+    drainer.start()
+
+    # Kill the process if it overruns the timeout; stdout.read() blocks until the
+    # process exits (or is killed), which is simpler than a select loop.
+    timed_out = {"v": False}
+
+    def _kill() -> None:
+        timed_out["v"] = True
+        try:
+            # Kill the whole process group (wpscan + ruby helpers), not just the
+            # parent, so the output pipe is released and read() unblocks at once.
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            try:
+                proc.kill()
+            except OSError:
+                pass
+
+    timer = threading.Timer(max(1, timeout), _kill)
+    timer.start()
+    try:
+        stdout_data = proc.stdout.read() if proc.stdout else ""
+        proc.wait()
+    finally:
+        timer.cancel()
+        drainer.join(timeout=2)
+
+    if timed_out["v"]:
+        if on_output:
+            on_output(f"!! killed after {timeout}s (timeout)")
         raise WPScanError(
             f"Scan of {url} timed out after {timeout}s. Aggressive plugin "
             f"detection probes thousands of paths and can exceed this on large "
             f"or slow sites. Raise SCAN_TIMEOUT, or set "
             f"WPSCAN_PLUGINS_DETECTION=mixed (or passive) for a faster scan."
-        ) from exc
+        )
+
+    returncode = proc.returncode
+    stderr_text = "\n".join(stderr_lines)
 
     # Try to parse stdout regardless of exit code.
-    report = _first_json(proc.stdout)
+    report = _first_json(stdout_data)
     if report is not None:
         # WPScan puts its own errors inside "scan_aborted" when it can't proceed.
         if report.get("scan_aborted"):
@@ -327,14 +391,29 @@ def run_wpscan(
         return report
 
     # No JSON -> surface the most useful error text we can find.
-    stderr = (proc.stderr or "").strip()
-    stdout = (proc.stdout or "").strip()
-    detail = stderr or stdout or f"exit code {proc.returncode}"
+    detail = stderr_text.strip() or (stdout_data or "").strip() \
+        or f"exit code {returncode}"
     if _looks_like_rate_limit(detail):
         raise RateLimitError(f"{url}: {detail[:500]}")
     if _looks_like_invalid_key(detail):
         raise InvalidKeyError(f"{url}: {detail[:500]}")
     raise WPScanError(f"WPScan produced no report for {url}: {detail[:500]}")
+
+
+def _redacted_cmd(cmd: list[str]) -> str:
+    """Render the command for display with the API token masked."""
+    out = []
+    redact_next = False
+    for part in cmd:
+        if redact_next:
+            out.append(part[:4] + "…" + part[-4:] if len(part) > 8 else "****")
+            redact_next = False
+        elif part == "--api-token":
+            out.append(part)
+            redact_next = True
+        else:
+            out.append(part)
+    return " ".join(out)
 
 
 def _first_json(text: str) -> dict[str, Any] | None:
@@ -445,12 +524,50 @@ class EventLog:
             self._events.clear()
 
 
+class ScanLog:
+    """
+    In-memory ring of raw verbose scan output lines for the live console.
+
+    This is display-only: it holds WPScan's progress stream so the UI can show
+    a terminal-like view of a scan in flight. It is never persisted to the
+    database and never included in exported reports — clearing it loses nothing
+    that matters to the findings. Lines carry a monotonic id so the frontend can
+    poll incrementally with a `since` cursor, exactly like EventLog.
+    """
+
+    def __init__(self, maxlen: int = 2000):
+        self._lines: list[dict[str, Any]] = []
+        self._next_id = 1
+        self._maxlen = maxlen
+        self._lock = threading.Lock()
+
+    def append(self, site: str, text: str) -> None:
+        with self._lock:
+            self._lines.append({"id": self._next_id, "site": site, "text": text})
+            self._next_id += 1
+            if len(self._lines) > self._maxlen:
+                self._lines = self._lines[-self._maxlen:]
+
+    def since(self, last_id: int) -> list[dict[str, Any]]:
+        with self._lock:
+            return [ln for ln in self._lines if ln["id"] > last_id]
+
+    def latest_id(self) -> int:
+        with self._lock:
+            return self._next_id - 1
+
+    def clear(self) -> None:
+        with self._lock:
+            self._lines.clear()
+
+
 class ScanManager:
     """
     Runs a batch of WPScan jobs on a thread pool. One batch at a time; the web
     layer checks `is_running()` before starting another. State lives in the DB,
     so the dashboard reflects progress by polling /api/findings. Progress events
-    (target changes, key rotation, completion) go to `self.events` for the UI.
+    (target changes, key rotation, completion) go to `self.events` for the UI,
+    and raw verbose scan output goes to `self.log` for the live console.
     """
 
     def __init__(self, db: Database, config: dict[str, Any]):
@@ -460,6 +577,7 @@ class ScanManager:
         self._running = False
         self._keyring = KeyRing([])
         self.events = EventLog()
+        self.log = ScanLog()
         self._done = 0
         self._total = 0
 
@@ -489,6 +607,7 @@ class ScanManager:
             # Reload keys each batch so edits to api_keys.txt take effect without
             # restarting the server. Shared across this batch's scan threads.
             self._keyring = build_keyring(self.config)
+            self.log.clear()  # fresh console per batch
             keys = self._keyring.count()
             self.events.emit(
                 "scan_start",
@@ -544,6 +663,7 @@ class ScanManager:
                     plugins_detection=self.config.get(
                         "WPSCAN_PLUGINS_DETECTION", "aggressive"),
                     extra_args=_split_args(self.config.get("WPSCAN_EXTRA_ARGS")),
+                    on_output=lambda line, s=site: self.log.append(s, line),
                 )
                 parsed = report_parser.parse_report(report, site_hint=site)
                 wp_findings = parsed["findings"]

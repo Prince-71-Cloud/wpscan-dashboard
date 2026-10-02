@@ -101,6 +101,21 @@ def api_ingest_samples():
     return jsonify({"ingested": count})
 
 
+@app.route("/api/scan-log")
+def api_scan_log():
+    """Live verbose scan output for the console panel. Display-only — these
+    lines are never stored or included in any exported report."""
+    try:
+        since = int(request.args.get("since", 0))
+    except (TypeError, ValueError):
+        since = 0
+    return jsonify({
+        "lines": manager.log.since(since),
+        "last_log_id": manager.log.latest_id(),
+        "scanning": manager.is_running(),
+    })
+
+
 @app.route("/api/export.json")
 def api_export_json():
     payload = report.build_report(db, CONFIG)

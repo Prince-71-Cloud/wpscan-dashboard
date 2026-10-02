@@ -13,6 +13,10 @@ const state = {
   lastEventId: 0,       // cursor so each progress toast is shown exactly once
   primed: false,        // suppress replaying old events on first page load
   scanning: false,
+  consoleOpen: false,   // verbose console panel visible
+  logTimer: null,
+  lastLogId: 0,
+  autoScroll: true,     // stick to bottom unless the user scrolls up
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -30,7 +34,14 @@ async function load() {
   const data = await res.json();
   state.findings = data.findings || [];
   state.sites = data.sites || [];
+  const wasScanning = state.scanning;
   state.scanning = !!data.scanning;
+  // Pop the console open on the rising edge of a scan so output is visible
+  // without a manual click (only after the first load, to avoid surprising
+  // the user on a page refresh while a scan happens to be running).
+  if (state.primed && state.scanning && !wasScanning && !state.consoleOpen) {
+    openConsole();
+  }
 
   // On first load, jump the cursor to the end so a page refresh mid-session
   // doesn't replay every event as a burst of toasts.
@@ -111,6 +122,59 @@ function dismissToast(t) {
   clearTimeout(Number(t.dataset.timer));
   t.classList.add("toast--out");
   setTimeout(() => t.remove(), 220);
+}
+
+/* --------------------------- Verbose console ------------------------ */
+/* A small side panel streaming WPScan's live output. It polls a dedicated
+ * endpoint while open so it stays light, and is purely a UI element — these
+ * lines are never part of an exported or printed report. */
+function openConsole() {
+  state.consoleOpen = true;
+  $("#console").hidden = false;
+  $("#btn-console").setAttribute("aria-pressed", "true");
+  document.body.classList.add("has-console");
+  pollLog();
+  if (!state.logTimer) state.logTimer = setInterval(pollLog, 1500);
+}
+
+function closeConsole() {
+  state.consoleOpen = false;
+  $("#console").hidden = true;
+  $("#btn-console").setAttribute("aria-pressed", "false");
+  document.body.classList.remove("has-console");
+  if (state.logTimer) { clearInterval(state.logTimer); state.logTimer = null; }
+}
+
+function toggleConsole() {
+  state.consoleOpen ? closeConsole() : openConsole();
+}
+
+async function pollLog() {
+  try {
+    const res = await fetch(`/api/scan-log?since=${state.lastLogId}`);
+    const data = await res.json();
+    const status = $("#console-status");
+    status.textContent = data.scanning ? "● running" : "idle";
+    status.className = "console__status" + (data.scanning ? " live" : "");
+    const lines = data.lines || [];
+    if (lines.length) {
+      const body = $("#console-body");
+      const frag = document.createDocumentFragment();
+      for (const ln of lines) {
+        const row = el("div", "cline");
+        // Dim our own synthetic markers ($ command, !! killed) vs scan output.
+        if (ln.text.startsWith("$ ")) row.classList.add("cline--cmd");
+        else if (ln.text.startsWith("!!")) row.classList.add("cline--err");
+        row.textContent = ln.text;
+        frag.appendChild(row);
+      }
+      body.appendChild(frag);
+      state.lastLogId = lines[lines.length - 1].id;
+      // Trim very long consoles in the DOM to stay responsive.
+      while (body.childNodes.length > 2500) body.removeChild(body.firstChild);
+      if (state.autoScroll) body.scrollTop = body.scrollHeight;
+    }
+  } catch { /* transient; try again next tick */ }
 }
 
 /* ----------------------------- Posture ------------------------------ */
@@ -421,6 +485,23 @@ $("#btn-export-pdf").addEventListener("click",
   () => download("/api/export.pdf", "PDF"));
 $("#btn-export-json").addEventListener("click",
   () => download("/api/export.json", "JSON"));
+
+/* Console controls */
+$("#btn-console").addEventListener("click", toggleConsole);
+$("#console-close").addEventListener("click", closeConsole);
+$("#console-clear").addEventListener("click", () => {
+  $("#console-body").innerHTML = "";
+});
+$("#console-wrap").addEventListener("click", (e) => {
+  const body = $("#console-body");
+  body.classList.toggle("wrap");
+  e.currentTarget.classList.toggle("on", body.classList.contains("wrap"));
+});
+// Pause auto-scroll when the user scrolls up to read; resume at the bottom.
+$("#console-body").addEventListener("scroll", (e) => {
+  const b = e.currentTarget;
+  state.autoScroll = (b.scrollHeight - b.scrollTop - b.clientHeight) < 24;
+});
 
 ["#search", "#filter-site", "#filter-type", "#sort"].forEach((sel) => {
   const node = $(sel);

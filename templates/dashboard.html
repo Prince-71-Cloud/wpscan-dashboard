@@ -19,6 +19,7 @@
       <span id="scan-state" class="scan-state" hidden></span>
       <button id="btn-scan" class="btn btn-primary">Run scan</button>
       <button id="btn-samples" class="btn">Load sample data</button>
+      <button id="btn-console" class="btn" aria-pressed="false">Scan output</button>
       <button id="btn-export-pdf" class="btn">Export PDF</button>
       <button id="btn-export-json" class="btn">Export JSON</button>
       <button id="btn-clear" class="btn btn-ghost">Clear</button>
@@ -92,6 +93,20 @@
       </div>
     </section>
   </main>
+
+  <!-- Live verbose scan console (display-only; never exported). Toggled by the
+       "Scan output" button. -->
+  <aside id="console" class="console" hidden aria-label="Live scan output">
+    <header class="console__bar">
+      <span class="console__title">Scan output</span>
+      <span id="console-status" class="console__status"></span>
+      <span class="console__spacer"></span>
+      <button id="console-wrap" class="console__btn" title="Toggle line wrap">wrap</button>
+      <button id="console-clear" class="console__btn" title="Clear console">clear</button>
+      <button id="console-close" class="console__btn" aria-label="Close">×</button>
+    </header>
+    <pre id="console-body" class="console__body" tabindex="0"></pre>
+  </aside>
 
   <!-- Scan progress notifications (populated by dashboard.js) -->
   <div id="toasts" class="toasts" aria-live="polite" aria-atomic="false"></div>

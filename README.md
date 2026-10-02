@@ -112,6 +112,21 @@ authorised to test, with agreed rules of engagement.
 
 ---
 
+## Live scan console
+
+Click **Scan output** in the header (it also opens automatically when a scan
+starts) to show a side panel that streams WPScan's live progress — the command
+being run (with the API token masked), each enumeration phase, plugins/themes as
+they're found, and any warnings. It polls while open, auto-scrolls unless you
+scroll up to read, and has `wrap` / `clear` controls.
+
+This console is **display-only**: the verbose output is held in memory for the
+current session, is never written to the database, and is deliberately excluded
+from exported reports. It is also hidden when you print the page, so a printed
+or PDF report never contains the raw scan log.
+
+---
+
 ## Exporting an audit report
 
 Two buttons in the header export whatever is currently stored:

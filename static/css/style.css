@@ -376,3 +376,80 @@ table.findings { width: 100%; border-collapse: collapse; min-width: 900px; }
 /* Clickable "scan failed" label reveals the stored error */
 .target .err-link { cursor: pointer; text-decoration: underline dotted; text-underline-offset: 2px; }
 .target .err-link:hover { color: #ff8793; }
+
+/* ------------------------------------------------------------------ *
+ * Live verbose scan console (side panel). Display-only; hidden in print.
+ * ------------------------------------------------------------------ */
+.console {
+  position: fixed;
+  top: 0;
+  right: 0;
+  width: 380px;
+  max-width: 92vw;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface-2, #0e1722);
+  border-left: 1px solid var(--border-2, #223042);
+  box-shadow: -12px 0 32px rgba(0, 0, 0, .4);
+  z-index: 55;
+  animation: console-in .18s ease-out;
+}
+@keyframes console-in { from { transform: translateX(16px); opacity: 0; } }
+
+.console__bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 10px;
+  border-bottom: 1px solid var(--border-2, #223042);
+  font-size: 12px;
+}
+.console__title { font-weight: 600; color: var(--text); }
+.console__spacer { flex: 1; }
+.console__status { font-size: 11px; color: var(--faint); font-family: var(--mono); }
+.console__status.live { color: var(--ok); }
+.console__btn {
+  background: transparent;
+  border: 1px solid var(--border-2, #223042);
+  color: var(--muted);
+  border-radius: 5px;
+  font-size: 11px;
+  padding: 2px 7px;
+  cursor: pointer;
+  font-family: var(--mono);
+}
+.console__btn:hover { color: var(--text); border-color: var(--accent); }
+.console__btn.on { color: var(--accent); border-color: var(--accent); }
+
+.console__body {
+  flex: 1;
+  margin: 0;
+  padding: 8px 10px;
+  overflow: auto;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: #b7c3d0;
+  white-space: pre;            /* no wrap by default: horizontal scroll */
+  background: var(--surface, #0a111a);
+}
+.console__body.wrap { white-space: pre-wrap; word-break: break-word; }
+.cline { white-space: inherit; }
+.cline--cmd { color: var(--accent); }
+.cline--err { color: var(--critical); }
+
+/* Nudge the main content left a touch when the console is open on wide screens
+ * so the two don't visually collide. */
+@media (min-width: 1200px) {
+  body.has-console main { padding-right: 396px; }
+}
+@media (max-width: 1199px) {
+  .console { width: 340px; }
+}
+
+/* Never print the live console, the toasts, or the header actions. */
+@media print {
+  .console, .toasts, .actions, #btn-console { display: none !important; }
+  body.has-console main { padding-right: 0 !important; }
+}
