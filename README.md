@@ -121,8 +121,9 @@ they're found, and any warnings. It polls while open, auto-scrolls unless you
 scroll up to read, and has `wrap` / `clear` controls.
 
 The console relies on WPScan's `--verbose` flag (added automatically) to emit
-live progress — without it, `--format json` scans run silently and the panel
-stays empty until the end. The raw JSON report is filtered out of the view so
+live progress, and runs WPScan attached to a pseudo-terminal so its output
+isn't buffered (Ruby buffers when writing to a pipe, which otherwise delays all
+output until the scan ends). The raw JSON report is filtered out of the view so
 you see human-readable progress (`[i] Enumerating…`, `[+] plugin`, `[!] vuln`)
 rather than a wall of JSON. Disable with `WPSCAN_VERBOSE=false`.
 
@@ -224,9 +225,11 @@ site replaces its findings so nothing goes stale.
 
 ## Troubleshooting
 
-**A target shows "scan failed".** Click the "scan failed" text on the target
-chip to see the exact error, or run `python show_errors.py` to print the stored
-error for every failed target.
+**A target shows "scan failed".** The reason is shown three ways: click the
+"scan failed" text on the chip for a popup, read the red `!! FAILED:` line in the
+Scan output console, or run `python show_errors.py` to print the stored error for
+every failed target. WPScan's own error lines (connection refused, Scan Aborted,
+WAF block, etc.) are extracted into the message.
 
 **Scan fails after a long wait (timeout).** Aggressive plugin detection
 (`--plugins-detection aggressive`, the default) probes thousands of plugin paths

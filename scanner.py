@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import subprocess
 import threading
@@ -255,6 +256,140 @@ def build_keyring(config: dict[str, Any]) -> KeyRing:
     return KeyRing(keys)
 
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+
+def _strip_ansi(text: str) -> str:
+    return _ANSI_RE.sub("", text)
+
+
+def _kill_group(proc: "subprocess.Popen") -> None:
+    """Kill the whole process group so WPScan's ruby children die too."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (OSError, ProcessLookupError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+def _emit_lines(buf: str, on_output, carry: list[str]) -> str:
+    """Split accumulated text on newlines/carriage-returns, forward complete
+    display-worthy lines to on_output, and return the leftover partial line.
+    Carriage returns matter because progress bars rewrite the current line."""
+    text = carry[0] + buf
+    out = []
+    line = ""
+    for ch in text:
+        if ch in "\n\r":
+            out.append(line)
+            line = ""
+        else:
+            line += ch
+    carry[0] = line  # keep the partial last line for next time
+    for ln in out:
+        ln = _strip_ansi(ln).rstrip()
+        if on_output and _is_displayable(ln):
+            on_output(ln)
+    return text
+
+
+def _run_pty(cmd: list[str], timeout: int, on_output):
+    """Run under a pseudo-terminal so output streams live. Returns
+    (combined_output_text, returncode, timed_out)."""
+    import pty
+
+    master_fd, slave_fd = pty.openpty()
+    try:
+        proc = subprocess.Popen(
+            cmd, stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
+            start_new_session=True, close_fds=True,
+        )
+    except FileNotFoundError:
+        os.close(master_fd)
+        os.close(slave_fd)
+        raise
+    os.close(slave_fd)  # parent only reads
+
+    chunks: list[str] = []
+    carry = [""]
+    timed_out = {"v": False}
+
+    def _kill():
+        timed_out["v"] = True
+        _kill_group(proc)
+
+    timer = threading.Timer(max(1, timeout), _kill)
+    timer.start()
+    try:
+        while True:
+            try:
+                data = os.read(master_fd, 4096)
+            except OSError:
+                break  # EIO on Linux signals the child closed the PTY (EOF)
+            if not data:
+                break
+            text = data.decode("utf-8", "replace")
+            chunks.append(text)
+            _emit_lines(text, on_output, carry)
+        # flush any trailing partial line
+        if carry[0].strip():
+            ln = _strip_ansi(carry[0]).rstrip()
+            if on_output and _is_displayable(ln):
+                on_output(ln)
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        _kill()
+    finally:
+        timer.cancel()
+        try:
+            os.close(master_fd)
+        except OSError:
+            pass
+    return "".join(chunks), proc.returncode, timed_out["v"]
+
+
+def _run_pipes(cmd: list[str], timeout: int, on_output):
+    """Fallback path (no PTY): plain pipes. Live output may be buffered by the
+    child, but parsing and timeout handling still work. Returns
+    (combined_output_text, returncode, timed_out)."""
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        bufsize=1, start_new_session=True,
+    )
+    chunks: list[str] = []
+    carry = [""]
+
+    def _drain():
+        try:
+            for line in proc.stdout:  # type: ignore[union-attr]
+                chunks.append(line)
+                _emit_lines(line, on_output, carry)
+        except (ValueError, OSError):
+            pass
+
+    drainer = threading.Thread(target=_drain, daemon=True)
+    drainer.start()
+
+    timed_out = {"v": False}
+
+    def _kill():
+        timed_out["v"] = True
+        _kill_group(proc)
+
+    timer = threading.Timer(max(1, timeout), _kill)
+    timer.start()
+    try:
+        proc.wait(timeout=timeout + 5)
+    except subprocess.TimeoutExpired:
+        _kill()
+    finally:
+        timer.cancel()
+        drainer.join(timeout=3)
+    return "".join(chunks), proc.returncode, timed_out["v"]
+
+
 def run_wpscan(
     url: str,
     wpscan_path: str = "wpscan",
@@ -299,75 +434,29 @@ def run_wpscan(
     if on_output:
         on_output(f"$ {_redacted_cmd(cmd)}")
 
+    # Ruby (and therefore WPScan) fully buffers its output when stdout is a pipe,
+    # so live progress never arrives until the scan ends. Running it attached to
+    # a pseudo-terminal makes it behave as if in a real terminal and flush line
+    # by line, which is what makes the live console work. Fall back to pipes if
+    # a PTY can't be created (non-POSIX).
+    use_pty = on_output is not None and hasattr(os, "openpty")
     try:
-        proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            bufsize=1,
-            # Own process group so a timeout can kill wpscan *and* its children
-            # (ruby spawns helpers); killing only the parent leaves children
-            # holding the output pipe open, so read() would block until they end.
-            start_new_session=True,
-        )
+        if use_pty:
+            output_text, returncode, timed_out_flag = _run_pty(
+                cmd, timeout, on_output)
+        else:
+            output_text, returncode, timed_out_flag = _run_pipes(
+                cmd, timeout, on_output)
     except FileNotFoundError as exc:
         raise WPScanError(
             f"'{wpscan_path}' not found. Install WPScan (gem install wpscan) "
             f"or ingest existing JSON reports instead."
         ) from exc
 
-    # Where WPScan writes progress depends on version and flags: usually the
-    # JSON report is on stdout and progress on stderr, but with --verbose the
-    # progress can land on stdout interleaved with the JSON. So drain BOTH pipes
-    # live on side threads: accumulate everything for parsing, and forward only
-    # display-worthy lines (not the raw JSON blob) to the console.
-    stdout_chunks: list[str] = []
-    stderr_lines: list[str] = []
+    stdout_data = output_text
+    stderr_text = output_text  # combined under a PTY; used only for error detail
 
-    def _drain(pipe, sink: list[str]) -> None:
-        try:
-            for line in pipe:
-                sink.append(line)
-                if on_output:
-                    text = line.rstrip("\n")
-                    if _is_displayable(text):
-                        on_output(text)
-        except (ValueError, OSError):
-            pass  # pipe closed when the process is killed
-
-    t_out = threading.Thread(target=_drain, args=(proc.stdout, stdout_chunks),
-                             daemon=True)
-    t_err = threading.Thread(target=_drain, args=(proc.stderr, stderr_lines),
-                             daemon=True)
-    t_out.start()
-    t_err.start()
-
-    # Kill the process if it overruns the timeout.
-    timed_out = {"v": False}
-
-    def _kill() -> None:
-        timed_out["v"] = True
-        try:
-            # Kill the whole process group (wpscan + ruby helpers), not just the
-            # parent, so the output pipe is released and read() unblocks at once.
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except (OSError, ProcessLookupError):
-            try:
-                proc.kill()
-            except OSError:
-                pass
-
-    timer = threading.Timer(max(1, timeout), _kill)
-    timer.start()
-    try:
-        proc.wait(timeout=timeout + 5)
-    except subprocess.TimeoutExpired:
-        _kill()
-    finally:
-        timer.cancel()
-        t_out.join(timeout=3)
-        t_err.join(timeout=3)
-    stdout_data = "".join(stdout_chunks)
-
-    if timed_out["v"]:
+    if timed_out_flag:
         if on_output:
             on_output(f"!! killed after {timeout}s (timeout)")
         raise WPScanError(
@@ -376,9 +465,6 @@ def run_wpscan(
             f"or slow sites. Raise SCAN_TIMEOUT, or set "
             f"WPSCAN_PLUGINS_DETECTION=mixed (or passive) for a faster scan."
         )
-
-    returncode = proc.returncode
-    stderr_text = "\n".join(stderr_lines)
 
     # Try to parse stdout regardless of exit code.
     report = _first_json(stdout_data)
@@ -405,14 +491,38 @@ def run_wpscan(
             raise WPScanError(f"{url}: vuln API error: {api_problem}")
         return report
 
-    # No JSON -> surface the most useful error text we can find.
-    detail = stderr_text.strip() or (stdout_data or "").strip() \
-        or f"exit code {returncode}"
+    # No JSON -> surface the most useful error text we can find. Pull out lines
+    # that look like errors rather than dumping raw progress, so the "scan
+    # failed" reason shown in the UI is actually meaningful.
+    detail = _extract_error_detail(stderr_text) or f"exit code {returncode}"
     if _looks_like_rate_limit(detail):
-        raise RateLimitError(f"{url}: {detail[:500]}")
+        raise RateLimitError(f"{url}: {detail[:600]}")
     if _looks_like_invalid_key(detail):
-        raise InvalidKeyError(f"{url}: {detail[:500]}")
-    raise WPScanError(f"WPScan produced no report for {url}: {detail[:500]}")
+        raise InvalidKeyError(f"{url}: {detail[:600]}")
+    raise WPScanError(f"WPScan produced no report for {url}: {detail[:600]}")
+
+
+def _extract_error_detail(text: str) -> str:
+    """From WPScan's (possibly verbose) output, pick the lines that explain a
+    failure: error markers, aborts, fatals. Falls back to the last few
+    non-empty lines, which usually carry the reason."""
+    if not text:
+        return ""
+    clean = [_strip_ansi(ln).rstrip() for ln in text.splitlines()]
+    clean = [ln for ln in clean if ln.strip()]
+    markers = ("[!]", "error", "aborted", "fatal", "cannot", "unable",
+               "failed", "refused", "timed out", "could not", "forbidden",
+               "blocked", "429", "403", "connection")
+    hits = [ln for ln in clean if any(m in ln.lower() for m in markers)]
+    if hits:
+        # De-duplicate, keep order, cap length.
+        seen, picked = set(), []
+        for ln in hits:
+            if ln not in seen:
+                seen.add(ln)
+                picked.append(ln)
+        return " | ".join(picked[-6:])
+    return " | ".join(clean[-4:])
 
 
 def _is_displayable(line: str) -> bool:
@@ -797,6 +907,7 @@ class ScanManager:
             except WPScanError as exc:
                 self.db.update_scan(scan_id, status="error", finished_at=time.time(),
                                     error=str(exc))
+                self.log.append(site, f"!! FAILED: {exc}")
                 self.events.emit("target_done",
                                  f"[{index}/{total}] {site} failed: {exc}",
                                  level="error")
@@ -805,6 +916,7 @@ class ScanManager:
             except Exception as exc:  # noqa: BLE001 — never let one site kill the batch
                 self.db.update_scan(scan_id, status="error", finished_at=time.time(),
                                     error=f"Unexpected error: {exc}")
+                self.log.append(site, f"!! FAILED (unexpected): {exc}")
                 self.events.emit("target_done",
                                  f"[{index}/{total}] {site} failed: {exc}",
                                  level="error")
@@ -820,6 +932,7 @@ class ScanManager:
                    f"rejected (free plan = 25 requests/day per key). Try again "
                    f"later or add more keys. Last response: {last_limit_err}")
         self.db.update_scan(scan_id, status="error", finished_at=time.time(), error=msg)
+        self.log.append(site, f"!! FAILED: {msg}")
         self.events.emit("target_done", f"[{index}/{total}] {site}: {msg}",
                          level="error")
         self._mark_done()
