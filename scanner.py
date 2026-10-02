@@ -62,6 +62,14 @@ class WPScanError(Exception):
     pass
 
 
+class PartialScanError(WPScanError):
+    """Raised when a scan is killed (e.g. timeout) but has partial findings.
+    The `partial` attribute holds {site, wp_version, target_ip, findings}."""
+    def __init__(self, message: str, partial: dict):
+        super().__init__(message)
+        self.partial = partial
+
+
 class KeyProblem(WPScanError):
     """Base for errors that mean 'this key is unusable — try the next one'."""
 
@@ -488,6 +496,7 @@ def run_wpscan(
     plugins_detection: str | None = "aggressive",
     extra_args: list[str] | None = None,
     on_output: "Callable[[str], None] | None" = None,
+    on_finding: "Callable[[dict], None] | None" = None,
     verbose: bool = True,
     fmt: str = "cli-no-colour",
 ) -> dict[str, Any]:
@@ -508,6 +517,12 @@ def run_wpscan(
 
     `on_output`, if given, receives each live progress line for the console.
     This live output is purely for display — never stored or exported.
+
+    `on_finding`, if given, is called immediately each time a complete finding is
+    parsed from the live output stream, so findings can be written to the database
+    and appear in the UI table *during* the scan rather than only at the end.
+    If WPScan is killed by the timeout, all findings discovered up to that point
+    are still available via this callback even though the scan never finished.
     """
     is_json = fmt == "json"
     cmd = [wpscan_path, "--url", url, "--format", fmt, "--no-banner",
@@ -526,6 +541,24 @@ def run_wpscan(
 
     if on_output:
         on_output(f"$ {_redacted_cmd(cmd)}")
+
+    # For CLI formats, build a StreamingParser that's fed each line as it
+    # arrives from the PTY so findings hit the DB in real time.
+    _streaming_parser: dict = {}
+    if not is_json:
+        import cli_parser as _cli_parser_mod
+        _sp = _cli_parser_mod.StreamingParser(
+            site_hint=url, on_finding=on_finding)
+        _streaming_parser["sp"] = _sp
+        _orig_on_output = on_output
+
+        def _combined_output(line: str) -> None:
+            # Feed into the live finding parser first, then into the console log.
+            _sp.feed(line)
+            if _orig_on_output:
+                _orig_on_output(line)
+
+        on_output = _combined_output
 
     # Ruby (and therefore WPScan) fully buffers its output when stdout is a pipe,
     # so live progress never arrives until the scan ends. Running it attached to
@@ -552,11 +585,21 @@ def run_wpscan(
     if timed_out_flag:
         if on_output:
             on_output(f"!! killed after {timeout}s (timeout)")
-        raise WPScanError(
-            f"Scan of {url} timed out after {timeout}s. Aggressive plugin "
-            f"detection probes thousands of paths and can exceed this on large "
-            f"or slow sites. Raise SCAN_TIMEOUT, or set "
-            f"WPSCAN_PLUGINS_DETECTION=mixed (or passive) for a faster scan."
+        # Flush the streaming parser to emit any finding that was mid-parse.
+        _sp2 = _streaming_parser.get("sp")
+        if _sp2 is not None:
+            _sp2.finish()
+            partial = _sp2.result()
+        else:
+            partial = {"site": url, "wp_version": None, "target_ip": None,
+                       "findings": []}
+        # Raise a PartialScanError so _scan_one can store findings + warning.
+        raise PartialScanError(
+            f"Scan of {url} timed out after {timeout}s — "
+            f"{len(partial['findings'])} finding(s) collected before timeout. "
+            f"Aggressive plugin detection probes thousands of paths. "
+            f"Raise SCAN_TIMEOUT or switch to WPSCAN_PLUGINS_DETECTION=mixed.",
+            partial=partial,
         )
 
     # ---- JSON format: parse the JSON report via parser.parse_report --------
@@ -606,7 +649,17 @@ def run_wpscan(
         raise InvalidKeyError(f"{url}: {_extract_error_detail(plain)[:600]}")
 
     import cli_parser
-    parsed = cli_parser.parse_cli(plain, site_hint=url)
+    # StreamingParser was already fed each line live during PTY output if
+    # on_finding was supplied; its result() already contains all findings
+    # discovered during the scan. If on_finding was not provided (or for any
+    # lines that arrived after _sp was set), fall back to parsing the full text.
+    _sp: "cli_parser.StreamingParser | None" = _streaming_parser.get("sp")
+    if _sp is not None:
+        _sp.finish()
+        parsed = _sp.result()
+    else:
+        parsed = cli_parser.parse_cli(plain, site_hint=url)
+
     # A completely empty parse usually means the scan never really ran (host
     # down, blocked). Treat that as a failure with whatever detail we can find.
     if not parsed["findings"] and "Interesting Finding" not in plain \
@@ -1035,6 +1088,22 @@ class ScanManager:
                 # run_wpscan returns an already-parsed report (cli_parser for
                 # cli formats, parser.parse_report for json), so the findings
                 # pipeline is identical regardless of format.
+                #
+                # For CLI format, on_finding fires the instant a finding is
+                # parsed from the live stream, so it appears in the table during
+                # the scan. We write it straight to the DB here; replace_findings
+                # at the end overwrites with the final complete set (no duplicates).
+                def _live_finding(f: dict, _scan_id: int = scan_id,
+                                  _site: str = site) -> None:
+                    self.db.add_finding_live(_site, _scan_id, f)
+                    self.events.emit(
+                        "finding_live",
+                        f"[{f['severity'].upper()}] {f['title'][:60]}",
+                        level=("error" if f["severity"] in ("critical","high")
+                               else "warn" if f["severity"] == "medium"
+                               else "info"),
+                    )
+
                 parsed = run_wpscan(
                     site,
                     wpscan_path=self.config.get("WPSCAN_PATH", "wpscan"),
@@ -1045,6 +1114,7 @@ class ScanManager:
                         "WPSCAN_PLUGINS_DETECTION", "aggressive"),
                     extra_args=_split_args(self.config.get("WPSCAN_EXTRA_ARGS")),
                     on_output=lambda line, s=site: self.log.append(s, line),
+                    on_finding=_live_finding,
                     verbose=_truthy(self.config.get("WPSCAN_VERBOSE", True)),
                     fmt=self.config.get("WPSCAN_FORMAT", "cli-no-colour"),
                 )
@@ -1115,6 +1185,26 @@ class ScanManager:
                     key = next_key
                     continue
                 break  # every key is now unusable
+            except PartialScanError as exc:
+                # Timeout with partial findings — save what we have.
+                partial = exc.partial
+                self.db.replace_findings(partial["site"] or site, scan_id,
+                                         partial["findings"])
+                self.db.update_scan(
+                    scan_id, status="partial", finished_at=time.time(),
+                    wp_version=partial.get("wp_version"),
+                    target_ip=partial.get("target_ip"),
+                    error=str(exc),
+                )
+                n = len(partial["findings"])
+                self.log.append(site, f"!! PARTIAL: {n} finding(s) saved before timeout")
+                self.events.emit(
+                    "target_done",
+                    f"[{index}/{total}] {site} partial — {n} finding(s) before timeout.",
+                    level="warn",
+                )
+                self._mark_done()
+                return
             except WPScanError as exc:
                 self.db.update_scan(scan_id, status="error", finished_at=time.time(),
                                     error=str(exc))

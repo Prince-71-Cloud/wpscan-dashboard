@@ -50,6 +50,8 @@ CREATE TABLE IF NOT EXISTS findings (
     created_at        REAL
 );
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_findings_dedup
+    ON findings(site, title, component_name);
 CREATE INDEX IF NOT EXISTS idx_findings_site     ON findings(site);
 CREATE INDEX IF NOT EXISTS idx_findings_severity ON findings(severity);
 """
@@ -125,6 +127,30 @@ class Database:
                     )
                     for f in findings
                 ],
+            )
+
+    def add_finding_live(self, site: str, scan_id: int, f: dict[str, Any]) -> None:
+        """Insert a single finding immediately as it's discovered during a live scan.
+        Existing findings for the same site are NOT cleared first — replace_findings
+        is called at the end of the scan to produce the final clean set. This method
+        is purely for making findings appear in the UI table in real time."""
+        site = site.rstrip("/")
+        with self._conn() as c:
+            c.execute(
+                """
+                INSERT OR IGNORE INTO findings
+                  (scan_id, site, finding_kind, component_type, component_name,
+                   component_version, title, severity, cvss, fixed_in, cves, refs, created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    scan_id, site, f.get("finding_kind"), f.get("component_type"),
+                    f.get("component_name"), f.get("component_version"), f.get("title"),
+                    f.get("severity"), f.get("cvss"), f.get("fixed_in"),
+                    json.dumps(f.get("cves") or []),
+                    json.dumps(f.get("references") or []),
+                    time.time(),
+                ),
             )
 
     def all_findings(self) -> list[dict[str, Any]]:

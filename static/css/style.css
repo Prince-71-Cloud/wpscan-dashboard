@@ -624,3 +624,7 @@ input[type="range"] { flex: 1; accent-color: var(--accent); }
   color: var(--ok);
 }
 .t-paused:hover:not(:disabled) { background: rgba(30,175,120,.1); }
+
+/* Partial scan (timed out with some findings saved) */
+.target.partial .dot { background: var(--medium); }
+.target.partial      { border-color: rgba(181,137,0,.4); }

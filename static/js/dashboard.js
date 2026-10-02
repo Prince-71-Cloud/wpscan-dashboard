@@ -239,6 +239,7 @@ function renderTargets(sites) {
 
     // Display class
     const cls = rawStatus === "success" ? "success"
+      : rawStatus === "partial" ? "partial"
       : rawStatus === "error"   ? "error"
       : isActive                ? "running"
       : isSitePaused            ? "site-paused"
@@ -260,6 +261,15 @@ function renderTargets(sites) {
       });
       node.appendChild(e);
 
+    } else if (rawStatus === "partial") {
+      const e = el("span", "err err-link", "partial ⚠");
+      e.title = "Click to see timeout details";
+      e.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        showToast(`${host(s.site)} — ${s.error || "Scan timed out with partial results"}`, "warn");
+      });
+      node.appendChild(e);
+
     } else if (rawStatus === "success" && s.wp_version) {
       const v = el("span", "badge-wp", `WP ${s.wp_version}`);
       node.appendChild(v);
@@ -278,10 +288,12 @@ function renderTargets(sites) {
     // Per-site controls
     const controls = el("span", "target-controls");
 
-    if (rawStatus === "error") {
-      // Retry button
+    if (rawStatus === "error" || rawStatus === "partial") {
+      // Retry button (also for partial — lets you re-run with a higher timeout)
       const retry = el("button", "t-btn t-retry", "↻");
-      retry.title = scanning ? "Wait for current scan to finish" : `Retry ${host(s.site)}`;
+      retry.title = scanning ? "Wait for current scan to finish"
+                  : rawStatus === "partial" ? `Re-scan ${host(s.site)} (previous timed out)`
+                  : `Retry ${host(s.site)}`;
       retry.disabled = scanning;
       retry.setAttribute("aria-label", `Retry ${host(s.site)}`);
       retry.addEventListener("click", (ev) => { ev.stopPropagation(); retryTarget(s.site); });

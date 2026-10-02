@@ -105,167 +105,191 @@ def _finding(site: str, title: str, ctype: str, cname: str,
     }
 
 
-def parse_cli(text: str, site_hint: str | None = None) -> dict[str, Any]:
-    """Parse cli-no-colour WPScan output into {site, wp_version, target_ip,
-    findings}. Best-effort and defensive: unrecognized lines are ignored."""
-    lines = (text or "").splitlines()
-    site = site_hint or ""
-    wp_version: str | None = None
-    target_ip: str | None = None
-    findings: list[dict[str, Any]] = []
+class StreamingParser:
+    """
+    Incremental, line-by-line parser for WPScan cli-no-colour output.
 
-    section_type: str | None = None   # "plugin" / "theme" / "user" / None
-    # Current component being accumulated.
-    cur_name: str | None = None
-    cur_version: str | None = None
-    cur_vulns: list[dict[str, Any]] = []
-    cur_vuln: dict[str, Any] | None = None
+    Feed one line at a time via `feed(line)`. Each time a complete finding is
+    recognised it is immediately passed to `on_finding(finding_dict)` so it can
+    be written to the database and appear in the UI *during* the scan rather than
+    only after WPScan finishes.
 
-    def flush_component() -> None:
-        nonlocal cur_name, cur_version, cur_vulns, cur_vuln
-        if cur_name and section_type in ("plugin", "theme", "core"):
-            ctype = section_type if section_type != "core" else "core"
-            if cur_vulns:
-                for v in cur_vulns:
-                    findings.append(_finding(
-                        site, v["title"], ctype, cur_name,
-                        cur_version, v.get("fixed_in"), v.get("cves", []),
-                        v.get("refs", [])))
-            # Outdated-but-no-CVE components are surfaced as a low finding so
-            # they still show up as worth updating.
-            elif cur_outdated["v"]:
-                findings.append(_finding(
-                    site, f"{cur_name} {cur_version or ''} is outdated".strip(),
-                    ctype, cur_name, cur_version, None, [], [],
-                    severity="low"))
-        cur_name = None
-        cur_version = None
-        cur_vulns = []
-        cur_vuln = None
-        cur_outdated["v"] = False
+    Call `result()` at the end to retrieve the full {site, wp_version, target_ip,
+    findings} dict — the same shape that parse_cli returns.
+    """
 
-    cur_outdated = {"v": False}
+    def __init__(self, site_hint: str | None = None,
+                 on_finding: "Callable[[dict], None] | None" = None):
+        from typing import Callable  # noqa: F401 (type hint only)
+        self.site        = site_hint or ""
+        self.wp_version: str | None = None
+        self.target_ip:  str | None = None
+        self._findings:  list[dict[str, Any]] = []
+        self._on_finding = on_finding
 
-    for raw in lines:
-        # URL / IP line (appears near the top, not guttered).
-        if site_hint is None and raw.startswith("[+] URL:"):
+        self._section_type: str | None = None
+        self._cur_name:    str | None = None
+        self._cur_version: str | None = None
+        self._cur_vulns:   list[dict[str, Any]] = []
+        self._cur_vuln:    dict[str, Any] | None = None
+        self._cur_outdated = False
+
+    def _emit(self, f: dict[str, Any]) -> None:
+        self._findings.append(f)
+        if self._on_finding:
+            self._on_finding(f)
+
+    def _flush(self) -> None:
+        ctype = self._section_type
+        if self._cur_name and ctype in ("plugin", "theme", "core"):
+            if self._cur_vulns:
+                for v in self._cur_vulns:
+                    self._emit(_finding(
+                        self.site, v["title"], ctype, self._cur_name,
+                        self._cur_version, v.get("fixed_in"),
+                        v.get("cves", []), v.get("refs", [])))
+            elif self._cur_outdated:
+                self._emit(_finding(
+                    self.site,
+                    f"{self._cur_name} {self._cur_version or ''} is outdated".strip(),
+                    ctype, self._cur_name, self._cur_version,
+                    None, [], [], severity="low"))
+        self._cur_name    = None
+        self._cur_version = None
+        self._cur_vulns   = []
+        self._cur_vuln    = None
+        self._cur_outdated = False
+
+    def feed(self, raw: str) -> None:
+        """Process one raw output line."""
+        # URL / IP
+        if self.site == "" and raw.startswith("[+] URL:"):
             m = re.search(r"URL:\s*(\S+)", raw)
             if m:
-                site = m.group(1).rstrip("/")
+                self.site = m.group(1).rstrip("/")
         ipm = _IP_RE.search(raw)
-        if ipm and target_ip is None:
-            target_ip = ipm.group(1)
+        if ipm and self.target_ip is None:
+            self.target_ip = ipm.group(1)
 
+        # WordPress version line
         wpm = _WP_VERSION_RE.search(raw)
         if wpm:
-            flush_component()
-            wp_version = wpm.group(1)
-            # Capture core vulnerabilities that follow under the version block.
-            section_type = "core"
-            cur_name = "WordPress core"
-            cur_version = wp_version
-            continue
+            self._flush()
+            self.wp_version      = wpm.group(1)
+            self._section_type   = "core"
+            self._cur_name       = "WordPress core"
+            self._cur_version    = self.wp_version
+            return
 
-        # "Interesting Finding(s):" section header.
+        # Interesting findings header
         if raw.strip().lower().startswith("interesting finding"):
-            flush_component()
-            section_type = "interesting"
-            continue
+            self._flush()
+            self._section_type = "interesting"
+            return
 
-        # Section header?
+        # Section headers
         sm = _SECTION_RE.search(raw)
         if sm:
-            flush_component()
+            self._flush()
             label = sm.group(1).strip().lower()
             if "plugin" in label:
-                section_type = "plugin"
+                self._section_type = "plugin"
             elif "theme" in label:
-                section_type = "theme"
+                self._section_type = "theme"
             elif "user" in label:
-                section_type = "user"
+                self._section_type = "user"
             else:
-                section_type = None
-            continue
+                self._section_type = None
+            return
 
-        # Lines that end any section / component block.
+        # End-of-section sentinels
         if (raw.startswith("[+] Finished") or raw.startswith("[+] Started")
                 or raw.startswith("[+] URL") or raw.startswith("[+] Requests")
                 or raw.startswith("[+] Data") or raw.startswith("[+] Elapsed")
                 or raw.startswith("[+] Memory")):
-            flush_component()
+            self._flush()
             if raw.startswith("[+] Finished"):
-                section_type = None
-            continue
+                self._section_type = None
+            return
 
-        # New component within a plugin/theme/user section.
+        # New component
         cm = _COMPONENT_RE.match(raw)
         if cm:
             name = cm.group(1).strip()
-            # In a user section each [+] is a username → a low finding.
-            if section_type == "user":
-                flush_component()
-                findings.append(_finding(
-                    site, f"User enumerated: {name}", "user", name,
-                    None, None, [], [], severity="low"))
-                continue
-            if section_type == "interesting":
-                flush_component()
+            if self._section_type == "user":
+                self._flush()
+                self._emit(_finding(self.site, f"User enumerated: {name}",
+                                    "user", name, None, None, [], [],
+                                    severity="low"))
+                return
+            if self._section_type == "interesting":
+                self._flush()
                 low = name.lower()
-                matched = next((entry for entry in _INTERESTING
-                                if entry[0] in low), None)
+                matched = next((e for e in _INTERESTING if e[0] in low), None)
                 if matched:
                     _, sev, label = matched
                     url_ref = re.search(r"(https?://\S+)", name)
-                    findings.append(_finding(
-                        site, f"{label}: {name}", "exposure", name.split(":")[0],
-                        None, None, [], [url_ref.group(1)] if url_ref else [],
-                        severity=sev))
-                # Non-matching interesting entries (e.g. Headers) are skipped;
-                # the passive checks module covers headers/CORS more precisely.
-                continue
-            if section_type in ("plugin", "theme"):
-                flush_component()
-                cur_name = name
-                continue
+                    self._emit(_finding(
+                        self.site, f"{label}: {name}", "exposure",
+                        name.split(":")[0], None, None, [],
+                        [url_ref.group(1)] if url_ref else [], severity=sev))
+                return
+            if self._section_type in ("plugin", "theme"):
+                self._flush()
+                self._cur_name = name
+                return
 
-        # Inside a component block (guttered lines).
+        # Guttered lines inside a component block
         body = _clean(raw)
         if not body:
-            continue
+            return
 
         vm = _VERSION_RE.search(body)
-        if vm and cur_name and cur_version is None:
-            cur_version = vm.group(1)
+        if vm and self._cur_name and self._cur_version is None:
+            self._cur_version = vm.group(1)
 
         if ("out of date" in body.lower()
                 or "the latest version is" in body.lower()):
-            cur_outdated["v"] = True
+            self._cur_outdated = True
 
         tm = _TITLE_RE.search(body)
         if tm:
-            cur_vuln = {"title": tm.group(1).strip(), "fixed_in": None,
-                        "cves": [], "refs": []}
-            cur_vulns.append(cur_vuln)
-            continue
+            self._cur_vuln = {"title": tm.group(1).strip(),
+                              "fixed_in": None, "cves": [], "refs": []}
+            self._cur_vulns.append(self._cur_vuln)
+            return
 
-        if cur_vuln is not None:
+        if self._cur_vuln is not None:
             fm = _FIXED_RE.search(body)
             if fm:
-                cur_vuln["fixed_in"] = fm.group(1)
+                self._cur_vuln["fixed_in"] = fm.group(1)
             cvem = _CVE_RE.search(body)
             if cvem:
-                cur_vuln["cves"].append("CVE-" + cvem.group(1)
-                                        if not cvem.group(1).upper().startswith("CVE")
-                                        else cvem.group(1))
+                cve = cvem.group(1)
+                self._cur_vuln["cves"].append(
+                    ("CVE-" + cve) if not cve.upper().startswith("CVE") else cve)
             um = _URL_REF_RE.search(body)
             if um:
-                cur_vuln["refs"].append(um.group(1))
+                self._cur_vuln["refs"].append(um.group(1))
 
-    flush_component()
+    def finish(self) -> None:
+        """Flush any component still in progress (call when output ends)."""
+        self._flush()
 
-    return {
-        "site": site.rstrip("/"),
-        "wp_version": wp_version,
-        "target_ip": target_ip,
-        "findings": findings,
-    }
+    def result(self) -> dict[str, Any]:
+        return {
+            "site":       self.site.rstrip("/"),
+            "wp_version": self.wp_version,
+            "target_ip":  self.target_ip,
+            "findings":   self._findings,
+        }
+
+
+def parse_cli(text: str, site_hint: str | None = None) -> dict[str, Any]:
+    """Parse a complete cli-no-colour WPScan output string. Delegates to
+    StreamingParser so both paths share one implementation."""
+    sp = StreamingParser(site_hint=site_hint)
+    for line in (text or "").splitlines():
+        sp.feed(line)
+    sp.finish()
+    return sp.result()
