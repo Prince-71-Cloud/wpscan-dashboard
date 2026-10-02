@@ -554,3 +554,73 @@ input[type="range"] { flex: 1; accent-color: var(--accent); }
 .settings-status { flex: 1; font-size: 12px; color: var(--ok); }
 
 @media print { .settings-panel { display: none !important; } }
+
+/* ------------------------------------------------------------------ *
+ * Sequential scan: per-site states and control buttons
+ * ------------------------------------------------------------------ */
+
+/* Queued — waiting for its turn */
+.target.queued .dot   { background: var(--faint); }
+.target.queued        { opacity: .65; }
+
+/* Per-site paused (hold set before this site's turn) */
+.target.site-paused .dot { background: var(--medium); animation: pulse 1.4s infinite; }
+.target.site-paused      { border-color: rgba(181,137,0,.4); }
+
+/* Batch paused state badge in header */
+.scan-state--paused { color: var(--medium) !important; }
+
+/* Per-site badge labels */
+.badge-wp     { color: var(--muted); font-size: 11.5px; }
+.badge-scan   { color: var(--accent); font-size: 11.5px; }
+.badge-queued { color: var(--faint);  font-size: 11px; }
+.badge-paused { color: var(--medium); font-size: 11px; }
+
+/* Container for the per-site control buttons */
+.target-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin-left: 3px;
+}
+
+/* Shared per-site button base */
+.t-btn {
+  flex: none;
+  width: 22px; height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border-radius: 5px;
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background .12s, transform .12s;
+}
+.t-btn:disabled { opacity: .35; cursor: not-allowed; }
+.t-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* Retry */
+.t-retry {
+  border: 1px solid rgba(255,93,108,.45);
+  color: var(--critical);
+}
+.t-retry:hover:not(:disabled) {
+  background: var(--critical-bg, rgba(255,93,108,.12));
+  transform: rotate(-90deg);
+}
+
+/* Pause (⏸) */
+.t-pause {
+  border: 1px solid rgba(181,137,0,.4);
+  color: var(--medium);
+}
+.t-pause:hover:not(:disabled) { background: rgba(181,137,0,.12); }
+
+/* Paused / resume (▶) */
+.t-paused {
+  border: 1px solid rgba(30,175,120,.4);
+  color: var(--ok);
+}
+.t-paused:hover:not(:disabled) { background: rgba(30,175,120,.1); }

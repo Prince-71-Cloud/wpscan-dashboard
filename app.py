@@ -64,6 +64,9 @@ def api_findings():
         "severities": SEVERITY_ORDER,
         "sites": list(sites.values()),
         "scanning": manager.is_running(),
+        "paused": manager.is_paused(),
+        "paused_site": manager.paused_site(),
+        "current_site": manager.current_site(),
         "progress": manager.progress(),
         "events": manager.events.since(since),
         "last_event_id": manager.events.latest_id(),
@@ -124,6 +127,47 @@ def api_settings():
                     pass
         return jsonify({"saved": True, "settings": {k: CONFIG[k] for k in editable}})
     return jsonify({k: CONFIG[k] for k in editable})
+
+
+@app.route("/api/pause", methods=["POST"])
+def api_pause():
+    """Pause the batch after the current site finishes."""
+    if not manager.is_running():
+        return jsonify({"error": "No scan running."}), 400
+    manager.pause()
+    return jsonify({"paused": True})
+
+
+@app.route("/api/resume", methods=["POST"])
+def api_resume():
+    """Resume a paused batch."""
+    manager.resume()
+    return jsonify({"resumed": True})
+
+
+@app.route("/api/cancel", methods=["POST"])
+def api_cancel():
+    """Cancel the batch after the current site finishes."""
+    manager.cancel()
+    return jsonify({"cancelled": True})
+
+
+@app.route("/api/pause-site", methods=["POST"])
+def api_pause_site():
+    """Pause before scanning a specific site (queues a hold for that site)."""
+    site = (request.get_json(silent=True) or {}).get("site", "")
+    if not site:
+        return jsonify({"error": "site required"}), 400
+    manager.pause_site(scanner.normalize_site(site))
+    return jsonify({"paused_site": site})
+
+
+@app.route("/api/resume-site", methods=["POST"])
+def api_resume_site():
+    """Resume a per-site pause."""
+    site = (request.get_json(silent=True) or {}).get("site", "")
+    manager.resume_site(scanner.normalize_site(site))
+    return jsonify({"resumed_site": site})
 
 
 @app.route("/api/scan-log")

@@ -29,6 +29,7 @@ import socket
 import ssl
 import subprocess
 import threading
+import time as time_module
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
 from typing import Any, Callable
@@ -861,57 +862,128 @@ class ScanManager:
         self.config = config
         self._lock = threading.Lock()
         self._running = False
+        self._paused = False          # batch-level pause flag
+        self._paused_site: str | None = None  # per-site pause (site URL or None)
+        self._cancel = False          # set True to abort the whole batch
         self._keyring = KeyRing([])
         self.events = EventLog()
         self.log = ScanLog()
         self._done = 0
         self._total = 0
+        self._current_site: str | None = None
 
     def is_running(self) -> bool:
         with self._lock:
             return self._running
 
+    def is_paused(self) -> bool:
+        with self._lock:
+            return self._paused
+
+    def paused_site(self) -> str | None:
+        with self._lock:
+            return self._paused_site
+
+    def current_site(self) -> str | None:
+        with self._lock:
+            return self._current_site
+
     def progress(self) -> dict[str, int]:
         with self._lock:
             return {"done": self._done, "total": self._total}
+
+    def pause(self) -> None:
+        """Pause after the current site finishes."""
+        with self._lock:
+            self._paused = True
+
+    def resume(self) -> None:
+        """Resume a paused batch."""
+        with self._lock:
+            self._paused = False
+            self._paused_site = None
+
+    def cancel(self) -> None:
+        """Cancel the batch after the current site finishes."""
+        with self._lock:
+            self._cancel = True
+            self._paused = False  # unblock the wait loop
+
+    def pause_site(self, site: str) -> None:
+        """Pause before scanning a specific site."""
+        with self._lock:
+            self._paused_site = site
+
+    def resume_site(self, site: str) -> None:
+        """Resume a per-site pause."""
+        with self._lock:
+            if self._paused_site == site:
+                self._paused_site = None
 
     def start_batch(self, sites: list[str]) -> bool:
         with self._lock:
             if self._running:
                 return False
             self._running = True
+            self._paused = False
+            self._paused_site = None
+            self._cancel = False
             self._done = 0
             self._total = len(sites)
         thread = threading.Thread(target=self._run_batch, args=(sites,), daemon=True)
         thread.start()
         return True
 
+    def _wait_if_paused(self, site: str | None = None) -> bool:
+        """Block while paused (batch-level or per-site). Returns False if cancelled."""
+        while True:
+            with self._lock:
+                if self._cancel:
+                    return False
+                batch_pause = self._paused
+                site_pause = (self._paused_site == site) if site else False
+            if not batch_pause and not site_pause:
+                return True
+            time_module.sleep(0.3)
+
     def _run_batch(self, sites: list[str]) -> None:
-        import time
-        started = time.time()
+        started = time_module.time()
         try:
-            # Reload keys each batch so edits to api_keys.txt take effect without
-            # restarting the server. Shared across this batch's scan threads.
             self._keyring = build_keyring(self.config)
-            self.log.clear()  # fresh console per batch
+            self.log.clear()
             keys = self._keyring.count()
             self.events.emit(
                 "scan_start",
-                f"Scan started — {len(sites)} target(s), "
+                f"Scan started — {len(sites)} target(s) sequentially, "
                 f"{keys if keys else 'no'} API key(s) in rotation.",
                 level="info",
             )
-            # Pre-create scan rows so the UI shows every site as "running".
-            scan_ids = {s: self.db.create_scan(s, status="running") for s in sites}
-            workers = max(1, int(self.config.get("MAX_CONCURRENT", 3)))
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                for idx, site in enumerate(sites, 1):
-                    pool.submit(self._scan_one, site, scan_ids[site], idx, len(sites))
+            # Sites run one at a time — sequential, predictable, cheap on API quota.
+            scan_ids = {s: self.db.create_scan(s, status="queued") for s in sites}
+            for idx, site in enumerate(sites, 1):
+                # Honour per-site pause (set by the UI before this site starts).
+                if not self._wait_if_paused(site):
+                    self.events.emit("scan_complete",
+                                     "Batch cancelled by user.", level="warn")
+                    return
+                # Mark the site as running now that we're about to scan it.
+                self.db.update_scan(scan_ids[site], status="running")
+                with self._lock:
+                    self._current_site = site
+                self._scan_one(site, scan_ids[site], idx, len(sites))
+                with self._lock:
+                    self._current_site = None
+                # Honour batch-level pause between sites.
+                if not self._wait_if_paused():
+                    self.events.emit("scan_complete",
+                                     "Batch cancelled by user.", level="warn")
+                    return
         finally:
             with self._lock:
                 self._running = False
+                self._current_site = None
                 done = self._done
-            elapsed = int(time.time() - started)
+            elapsed = int(time_module.time() - started)
             statuses = self.db.latest_scan_status()
             ok = sum(1 for s in sites if statuses.get(s, {}).get("status") == "success")
             failed = len(sites) - ok

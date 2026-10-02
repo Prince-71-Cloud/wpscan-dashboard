@@ -24,7 +24,7 @@ _SCHEMA = """
 CREATE TABLE IF NOT EXISTS scans (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     site        TEXT NOT NULL,
-    status      TEXT NOT NULL,              -- pending|running|success|error
+    status      TEXT NOT NULL,              -- queued|running|success|error|paused
     started_at  REAL,
     finished_at REAL,
     wp_version  TEXT,

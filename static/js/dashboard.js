@@ -13,6 +13,9 @@ const state = {
   lastEventId: 0,       // cursor so each progress toast is shown exactly once
   primed: false,        // suppress replaying old events on first page load
   scanning: false,
+  paused: false,
+  pausedSite: null,
+  currentSite: null,
   consoleOpen: false,   // verbose console panel visible
   logTimer: null,
   lastLogId: 0,
@@ -35,7 +38,10 @@ async function load() {
   state.findings = data.findings || [];
   state.sites = data.sites || [];
   const wasScanning = state.scanning;
-  state.scanning = !!data.scanning;
+  state.scanning    = !!data.scanning;
+  state.paused      = !!data.paused;
+  state.pausedSite  = data.paused_site  || null;
+  state.currentSite = data.current_site || null;
   // Pop the console open on the rising edge of a scan so output is visible
   // without a manual click (only after the first load, to avoid surprising
   // the user on a page refresh while a scan happens to be running).
@@ -220,42 +226,93 @@ function renderPosture(summary) {
 function renderTargets(sites) {
   const wrap = $("#targets");
   wrap.innerHTML = "";
-  const scanning = state.scanning;
+  const scanning    = state.scanning;
+  const paused      = state.paused;
+  const pausedSite  = state.pausedSite;
+  const currentSite = state.currentSite;
+
   sites.forEach((s) => {
-    const status = s.status || "not scanned";
-    const cls = status === "success" ? "success"
-      : status === "error" ? "error"
-      : status === "running" ? "running" : "not";
+    const rawStatus = s.status || "not scanned";
+    const isActive    = scanning && currentSite === s.site;
+    const isQueued    = scanning && rawStatus === "queued";
+    const isSitePaused = scanning && pausedSite === s.site && !isActive;
+
+    // Display class
+    const cls = rawStatus === "success" ? "success"
+      : rawStatus === "error"   ? "error"
+      : isActive                ? "running"
+      : isSitePaused            ? "site-paused"
+      : isQueued                ? "queued"
+      : rawStatus === "running" ? "running"
+      : "not";
+
     const node = el("div", `target ${cls}`);
     node.appendChild(el("span", "dot"));
     node.appendChild(el("span", "host", host(s.site)));
-    if (status === "error" && s.error) {
+
+    // Status label
+    if (rawStatus === "error" && s.error) {
       const e = el("span", "err err-link", "scan failed");
-      e.title = "Click to see why";
-      // The failure reason is stored but easy to miss — surface it on click.
+      e.title = "Click to see error";
       e.addEventListener("click", (ev) => {
         ev.stopPropagation();
         showToast(`${host(s.site)} — ${s.error}`, "error");
       });
       node.appendChild(e);
-      // Retry just this target (a batch of one) without re-running everything.
-      const retry = el("button", "retry", "↻");
-      retry.type = "button";
-      retry.title = scanning ? "A scan is already running" : `Retry ${host(s.site)}`;
-      retry.setAttribute("aria-label", `Retry scan of ${host(s.site)}`);
-      retry.disabled = scanning;
-      retry.addEventListener("click", (ev) => {
-        ev.stopPropagation();
-        retryTarget(s.site);
-      });
-      node.appendChild(retry);
-    } else if (status === "success" && s.wp_version) {
-      node.appendChild(el("span", "err", `WP ${s.wp_version}`));
-      node.lastChild.style.color = "var(--muted)";
-    } else if (status === "running") {
-      node.appendChild(el("span", "err", "scanning…"));
-      node.lastChild.style.color = "var(--muted)";
+
+    } else if (rawStatus === "success" && s.wp_version) {
+      const v = el("span", "badge-wp", `WP ${s.wp_version}`);
+      node.appendChild(v);
+
+    } else if (isActive) {
+      node.appendChild(el("span", "badge-scan", "scanning…"));
+
+    } else if (isSitePaused) {
+      const p = el("span", "badge-paused", "⏸ paused");
+      node.appendChild(p);
+
+    } else if (isQueued) {
+      node.appendChild(el("span", "badge-queued", "queued"));
     }
+
+    // Per-site controls
+    const controls = el("span", "target-controls");
+
+    if (rawStatus === "error") {
+      // Retry button
+      const retry = el("button", "t-btn t-retry", "↻");
+      retry.title = scanning ? "Wait for current scan to finish" : `Retry ${host(s.site)}`;
+      retry.disabled = scanning;
+      retry.setAttribute("aria-label", `Retry ${host(s.site)}`);
+      retry.addEventListener("click", (ev) => { ev.stopPropagation(); retryTarget(s.site); });
+      controls.appendChild(retry);
+
+    } else if (scanning && isQueued) {
+      // Pause-before button — hold this site before WPScan starts on it
+      const isPending = pausedSite === s.site;
+      const pbtn = el("button", `t-btn ${isPending ? "t-paused" : "t-pause"}`,
+                      isPending ? "▶" : "⏸");
+      pbtn.title = isPending ? "Click to let this site run" : `Hold before ${host(s.site)}`;
+      pbtn.setAttribute("aria-label", isPending ? "Resume site" : "Pause before site");
+      pbtn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        isPending ? resumeSite(s.site) : pauseSite(s.site);
+      });
+      controls.appendChild(pbtn);
+
+    } else if (scanning && isActive) {
+      // Currently scanning — show a "pause batch after this" button
+      const pbatch = el("button", `t-btn ${paused ? "t-paused" : "t-pause"}`,
+                        paused ? "▶" : "⏸");
+      pbatch.title = paused ? "Resume batch" : "Pause after this site";
+      pbatch.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        paused ? resumeBatch() : pauseBatch();
+      });
+      controls.appendChild(pbatch);
+    }
+
+    if (controls.children.length) node.appendChild(controls);
     wrap.appendChild(node);
   });
 }
@@ -293,19 +350,67 @@ function renderSiteFilter(sites) {
 }
 
 function renderScanState(scanning, progress) {
-  const badge = $("#scan-state");
-  const btn = $("#btn-scan");
+  const badge  = $("#scan-state");
+  const btn    = $("#btn-scan");
+  const pbtn   = $("#btn-pause");
+  const canbtn = $("#btn-cancel");
   if (scanning) {
     badge.hidden = false;
     const p = progress || {};
-    badge.textContent = p.total
-      ? `Scanning… ${p.done || 0}/${p.total}`
-      : "Scanning…";
+    const prog = p.total ? `${p.done || 0}/${p.total}` : "";
+    badge.textContent = state.paused
+      ? `⏸ Paused ${prog}`
+      : `Scanning… ${prog}`;
+    badge.className = "scan-state" + (state.paused ? " scan-state--paused" : "");
     btn.disabled = true;
+    if (pbtn) {
+      pbtn.hidden = false;
+      pbtn.textContent = state.paused ? "▶ Resume" : "⏸ Pause";
+      pbtn.title = state.paused ? "Resume batch" : "Pause after current site";
+    }
+    if (canbtn) canbtn.hidden = false;
   } else {
     badge.hidden = true;
+    badge.className = "scan-state";
     btn.disabled = false;
+    if (pbtn)  pbtn.hidden = true;
+    if (canbtn) canbtn.hidden = true;
   }
+}
+
+/* ------------- Batch-level pause / resume / cancel ------------------- */
+async function pauseBatch() {
+  await fetch("/api/pause", { method: "POST" });
+  showToast("Batch will pause after the current site finishes.", "info");
+  await load();
+}
+async function resumeBatch() {
+  await fetch("/api/resume", { method: "POST" });
+  showToast("Batch resumed.", "info");
+  await load();
+}
+async function cancelBatch() {
+  if (!confirm("Cancel the scan batch? Sites not yet scanned will be skipped.")) return;
+  await fetch("/api/cancel", { method: "POST" });
+  showToast("Batch cancelled.", "warn");
+  await load();
+}
+/* ------------- Per-site pause / resume ------------------------------- */
+async function pauseSite(site) {
+  await fetch("/api/pause-site", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ site }),
+  });
+  showToast(`Scan will hold before ${host(site)}.`, "info");
+  await load();
+}
+async function resumeSite(site) {
+  await fetch("/api/resume-site", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ site }),
+  });
+  showToast(`Releasing hold on ${host(site)}.`, "info");
+  await load();
 }
 
 /* ------------------------ Filter + sort + render -------------------- */
@@ -545,6 +650,10 @@ $("#btn-export-pdf").addEventListener("click",
   () => download("/api/export.pdf", "PDF"));
 $("#btn-export-json").addEventListener("click",
   () => download("/api/export.json", "JSON"));
+
+/* Batch controls */
+$("#btn-pause").addEventListener("click",  () => state.paused ? resumeBatch() : pauseBatch());
+$("#btn-cancel").addEventListener("click", cancelBatch);
 
 /* Console controls */
 $("#btn-console").addEventListener("click", toggleConsole);

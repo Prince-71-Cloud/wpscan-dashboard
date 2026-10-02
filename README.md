@@ -112,6 +112,30 @@ authorised to test, with agreed rules of engagement.
 
 ---
 
+## Sequential scanning and pause controls
+
+Scans run **one site at a time** in the order they appear in `sites.txt`. This is
+intentional: it makes API key consumption predictable (one API request per site),
+keeps the live console output readable (one stream, not three mixed together), and
+lets you pause or cancel cleanly between sites.
+
+**Batch controls (header bar while scanning):**
+* **⏸ Pause** — holds after the current site finishes. The current scan is never
+  interrupted mid-flight.
+* **▶ Resume** — continues from the next queued site.
+* **✕ Cancel** — skips all remaining queued sites.
+
+**Per-site controls (on each chip):**
+* **⏸** on a queued site — hold before that specific site starts. The batch
+  continues with the sites before it, then waits. Click **▶** on the chip to
+  release.
+* **↻** on a failed site — retry just that one site without re-running the batch.
+
+**Chip states:** scanning… (active, blue dot) → queued (grey, dimmed) →
+⏸ paused (amber dot, hold set) → success (green) → scan failed (red, with ↻).
+
+---
+
 ## Live scan console
 
 Click **Scan output** in the header (it also opens automatically when a scan
