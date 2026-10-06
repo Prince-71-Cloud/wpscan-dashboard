@@ -29,42 +29,64 @@ console immediately — no WPScan install or live targets needed.
 
 ## Running real scans
 
-1. Install WPScan (Ruby):
-   ```bash
-   gem install wpscan          # or use the official Docker image
-   ```
-2. (Recommended) Add one or more free API keys from <https://wpscan.com/profile>
-   for full vulnerability data. Copy the template and add your keys, one per line:
-   ```bash
-   cp api_keys.txt.example api_keys.txt
-   # then edit api_keys.txt:
-   #   0123456789abcdef0123456789abcdef0123456789abcdef01
-   #   fedcba9876543210fedcba9876543210fedcba9876543210fe
-   ```
-   The free plan allows **25 requests per key per day**, so list as many keys as
-   you have. The dashboard uses them **round-robin** — each site in a batch takes
-   the next key in the list, so the daily quota is spread across every key rather
-   than draining the first one. If a key comes back rate-limited or rejected, it
-   is retired for the session and the scan is **retried immediately on the next
-   key**; a site only errors once every key is spent. Keys are re-read at the
-   start of each scan batch, so you can add keys without restarting, and
-   `api_keys.txt` is `.gitignore`d so your keys are never committed. (A single
-   `WPSCAN_API_TOKEN` env var still works and joins the rotation.)
+### Install WPScan
 
-   To confirm your keys are being read, run:
-   ```bash
-   python scanner.py
-   ```
-   It prints the resolved key-file path, how many keys were parsed (masked), and
-   the round-robin order — useful if you suspect only one key is in play.
-3. List your targets in `sites.txt` (one URL per line; `#` comments allowed).
-4. Start the app and click **Run scan**. Scans run in the background; the target
-   chips turn green (success) or red (failed), and the table fills in as results
-   arrive. A failed target shows a **retry icon (↻)** — click it to rescan just
-   that one site without re-running the whole batch. Progress appears as toast notifications in the bottom-right corner:
-   when a scan starts, as it moves to each target, whenever an API key is
-   rotated, and a summary when the whole batch finishes. The header badge shows
-   live progress (`Scanning… 2/3`).
+Install the Ruby gem or use the official Docker image:
+
+```bash
+gem install wpscan
+```
+
+### Configure API keys
+
+For full vulnerability data, add one or more free API keys from
+<https://wpscan.com/profile>. Copy the template, then replace its dummy values
+with your own keys, one per line:
+
+```bash
+cp api_keys.txt.example api_keys.txt
+```
+
+The free plan allows **25 requests per key per day**. The current key is reused
+across sites; when WPScan rejects it or reports a rate limit, the key is retired
+for the running session and the scan retries with the next available key. Keys
+are re-read at the start of each batch, so edits take effect without restarting
+the app. `api_keys.txt` is gitignored; never commit real keys. A single
+`WPSCAN_API_TOKEN` environment variable is also supported and is tried before
+keys from the file.
+
+To check which keys were loaded, run `python scanner.py`. It prints the resolved
+key-file path, the number of parsed keys (masked), and the available key order.
+This is a configuration diagnostic; during scans, the current key is reused
+until WPScan rejects it or reports a rate limit.
+
+### Configure targets
+
+Replace the reserved example URLs in `sites.txt` with targets you are authorized
+to scan. Use one URL per line; lines beginning with `#` are ignored.
+
+### Run a scan
+
+Start the app using the Quick start instructions, then click **Run scan**. A
+pre-flight check tests reachability and looks for a WordPress fingerprint;
+targets that fail are skipped before WPScan runs. Scans run in the background
+and findings appear as they are parsed. A failed target shows a retry button to
+rescan just that site. Progress notifications report scan start, target progress,
+key rotation, and batch completion.
+
+### Dashboard workflow
+
+* **Try a demo:** click **Load sample data**. This ingests the bundled JSON
+  reports; it does not run WPScan or contact the listed sites.
+* **Review findings:** use the search box and site/component filters to narrow
+  the table. Click severity chips to toggle those findings, and use the sort
+  menu to group results by severity, site, component type, or component name.
+* **Watch a scan:** click **Scan output** to open the live console. It shows
+  WPScan progress and masks API tokens. The console is temporary and is not
+  included in saved data or exports.
+* **Export or clear:** use **Export PDF** or **Export JSON** to download a report.
+  **Clear** deletes stored scans and findings from the database; it does not
+  change `sites.txt` or `api_keys.txt`.
 
 Scans run a thorough enumeration by default —
 `--enumerate vp,vt,u,cb,dbe --plugins-detection aggressive` — so vulnerable
@@ -112,14 +134,15 @@ authorised to test, with agreed rules of engagement.
 
 ---
 
-## Sequential scanning and pause controls
+## Scan settings and controls
 
-Scans run **one site at a time** in the order they appear in `sites.txt`. This is
-intentional: it makes API key consumption predictable (one API request per site),
-keeps the live console output readable (one stream, not three mixed together), and
-lets you pause or cancel cleanly between sites.
+Scans run **one site at a time** in the order they appear in `sites.txt`. Open
+**Settings** before a batch to change the pre-flight check, pre-flight timeout,
+scan timeout, plugin-detection mode, and enumeration flags. These settings are
+held in memory and reset when the server restarts. The **Max concurrent scans**
+field is currently not applied; batches remain sequential.
 
-**Batch controls (header bar while scanning):**
+**Batch controls (header while scanning):**
 * **⏸ Pause** — holds after the current site finishes. The current scan is never
   interrupted mid-flight.
 * **▶ Resume** — continues from the next queued site.
@@ -190,15 +213,19 @@ All settings are environment variables (see `config.py`):
 | `WPSCAN_PATH` | `wpscan` | Path to the WPScan binary |
 | `WPSCAN_ENUMERATE` | `vp,vt,u,cb,dbe` | What WPScan enumerates |
 | `WPSCAN_PLUGINS_DETECTION` | `aggressive` | Plugin detection mode (`passive`/`mixed`/`aggressive`) |
+| `WPSCAN_VERBOSE` | `true` | Stream live scan progress to the console |
+| `WPSCAN_FORMAT` | `cli-no-colour` | WPScan output format; CLI output enables live findings |
 | `WPSCAN_EXTRA_ARGS` | *(none)* | Extra raw wpscan args, e.g. `--throttle 500` |
+| `PREFLIGHT_CHECK` | `true` | Check reachability and WordPress fingerprint before scanning |
+| `PREFLIGHT_TIMEOUT` | `10` | Pre-flight timeout in seconds |
 | `EXTRA_CHECKS` | `true` | Run passive web-hygiene checks after each scan |
 | `CHECK_TIMEOUT` | `10` | Per-request timeout for hygiene checks (seconds) |
 | `WPSCAN_API_TOKEN` | *(none)* | Optional single key, added to the front of the rotation |
 | `API_KEYS_FILE` | `api_keys.txt` | File of API keys, rotated when one hits its daily limit |
 | `SITES_FILE` | `sites.txt` | Target list |
 | `DATABASE` | `dashboard.db` | SQLite file |
-| `SCAN_TIMEOUT` | `600` | Per-site scan timeout (seconds) |
-| `MAX_CONCURRENT` | `3` | Parallel scans per batch |
+| `SCAN_TIMEOUT` | `1800` | Per-site scan timeout (seconds) |
+| `MAX_CONCURRENT` | `3` | Settings value only; scans currently run sequentially |
 | `SAMPLE_DIR` | `sample_scans` | Directory of JSON reports to ingest |
 | `HOST` / `PORT` | `127.0.0.1` / `5000` | Bind address |
 
@@ -241,8 +268,12 @@ site replaces its findings so nothing goes stale.
 |---|---|---|
 | GET | `/` | Dashboard page |
 | GET | `/api/findings` | All findings + severity summary + per-site status |
-| POST | `/api/scan` | Start a WPScan batch over `sites.txt` (background) |
+| POST | `/api/scan` | Start a background batch from `sites.txt`; JSON `{ "site": "https://example.com" }` retries one site |
 | POST | `/api/ingest-samples` | Load JSON reports from `SAMPLE_DIR` |
+| GET/POST | `/api/settings` | Read or update runtime scan settings |
+| POST | `/api/pause`, `/api/resume`, `/api/cancel` | Pause between sites, resume, or cancel the batch |
+| POST | `/api/pause-site`, `/api/resume-site` | Hold or release a queued site; JSON body includes `site` |
+| GET | `/api/scan-log` | Incremental live console output (`?since=<id>`) |
 | GET | `/api/export.json` | Full audit report as JSON (download) |
 | GET | `/api/export.pdf` | Full audit report as PDF (download) |
 | POST | `/api/clear` | Wipe stored scans and findings |
