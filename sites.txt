@@ -1,1 +1,3 @@
-https://vivasoft.com.np
+https://example.com
+https://docs.example.com
+https://shop.example.com
