@@ -8,3 +8,6 @@ venv/
 # Copy api_keys.txt.example to api_keys.txt and add your keys.
 api_keys.txt
 !api_keys.txt.example
+
+# Local assistant notes (kept out of the public repo)
+CLAUDE.md

@@ -16,6 +16,15 @@ a client-ready PDF or JSON audit report.
 the PDF/JSON reports. Click the image to play
 ([download the MP4](docs/media/user-manual.mp4)).*
 
+## 📸 Screenshot tour
+
+| | | |
+|:---:|:---:|:---:|
+| [<img src="docs/media/dashboard.png" width="260" alt="Dashboard">](#32-reading-the-dashboard)<br>**Dashboard** | [<img src="docs/media/scan-running.png" width="260" alt="Scan running">](#42-start-a-scan)<br>**Live scan** | [<img src="docs/media/scan-paused.png" width="260" alt="Batch paused">](#43-pause-resume-and-cancel)<br>**Pause / cancel** |
+| [<img src="docs/media/settings.png" width="260" alt="Settings">](#41-tune-the-settings-optional)<br>**Settings** | [<img src="docs/media/scan-failed.png" width="260" alt="Failed target">](#8-troubleshooting)<br>**Failed target** | [<img src="docs/media/pdf-report.png" width="150" alt="PDF report">](#5-exporting-the-audit-report)<br>**PDF report** |
+
+*All screenshots use the bundled `example.*` sample sites.*
+
 ---
 
 ## Contents
@@ -92,23 +101,59 @@ and duplicate entries are scanned only once.
 
 ## 3. Using the dashboard
 
+### 3.1 First run
+
+![Empty dashboard on first run](docs/media/first-run.png)
+
+On first launch the dashboard is empty:
+
+1. **Header buttons** (top right): **Run scan** · **Load sample data** ·
+   **⚙ Settings** · **Scan output** (live console) · **Export PDF** ·
+   **Export JSON** · **Clear**.
+2. **Summary band** shows `0/N sites scanned` — N is the number of targets in
+   `sites.txt`.
+3. **Site chips** list every configured target as *not scanned*.
+4. The **empty-state message** points you to `sites.txt` or the sample data.
+
+Click **Load sample data** for an instant demo, or **Run scan** once your
+targets and API keys are set up.
+
+### 3.2 Reading the dashboard
+
 ![Dashboard with findings](docs/media/dashboard.png)
 
-| Area | What it shows |
-|---|---|
-| **Severity summary** | Sites scanned, open findings, and a bar of findings per severity. |
-| **Site chips** | One chip per target with its status and WordPress version. |
-| **Findings table** | Every finding ranked worst first: severity, title, site, component, installed version, *fixed in* version, and CVE / advisory links. |
+1. **Sites scanned / open findings** — how many targets have a successful scan,
+   and how many findings are currently open across all of them.
+2. **Severity bar and legend** — the share of findings per severity
+   (critical · high · medium · low · info). Click a legend chip to hide or show
+   that severity in the table.
+3. **Site chips** — one per target. The dot shows its status (green success,
+   amber partial, red failed, grey not scanned) next to the detected WordPress
+   version.
+4. **Findings table** — every finding ranked worst first:
 
-**Header buttons:** **Run scan** · **Load sample data** · **⚙ Settings** ·
-**Scan output** (live console) · **Export PDF** · **Export JSON** · **Clear**.
+   | Column | Meaning |
+   |---|---|
+   | **Severity** | Critical → info ([how it's decided](#7-how-severity-is-decided)). Tags like `exposure` or `outdated` mark non-CVE findings; a `CVSS` score is shown when WPScan provides one. |
+   | **Finding** | The vulnerability or exposure title. |
+   | **Site** | Which target it was found on. |
+   | **Component** | Type (core · plugin · theme · config · user) and name, e.g. `plugin` / `contact-form-7`. |
+   | **Version** | The installed version WPScan detected. |
+   | **Fixed in** | The first version that fixes it (green), or `no fix`. Upgrading to at least this version resolves the finding. |
+   | **References** | CVE IDs and advisory links. |
 
-### Search, filter and sort
+### 3.3 Search, filter and sort
 
-- **Search** matches finding titles, components and CVEs.
-- **Site** and **component type** filters narrow the table.
-- Click the **severity chips** in the summary to show or hide a severity.
-- **Sort** by severity, site, component type, or component name.
+![Searching for "upload"](docs/media/filter.png)
+
+- **Search box** — matches finding titles, component names and CVE IDs as you
+  type. Above, searching `upload` narrows 12 findings to the 2 file-upload
+  issues.
+- **All sites** — show findings for one target only.
+- **All components** — show only core, plugin, theme, config, server or user
+  findings.
+- **Sort** — by severity (default), site, component type, or component name.
+- The counter on the right (`2 of 12 findings`) shows how much is filtered out.
 
 ### Load or clear data
 
@@ -152,6 +197,15 @@ defaults use the [environment variables](#9-configuration-reference).
 4. Toast notifications report scan start, each target, key rotation, and the
    batch summary.
 
+What you see in the screenshot above:
+
+- **Header** — `Scanning… 1/3` progress, plus **⏸ Pause** and **✕ Cancel**.
+- **Site chips** — the active site says *scanning…*; the others say *queued*,
+  each with a ⏸ button to hold it before it starts.
+- **Findings table** — already shows the new Elementor Pro findings for the
+  first site while the second is still being scanned.
+- **Scan output** panel (right) — WPScan's live progress for the current site.
+
 Each successful scan is followed by the passive
 [web-hygiene checks](#6-what-it-checks).
 
@@ -167,6 +221,11 @@ Each successful scan is followed by the passive
 - **✕ Cancel** — skips all remaining sites. Skipped sites keep their previous
   results and are reported as *skipped*, not failed.
 
+In the screenshot, **⏸ Pause** was clicked while `docs.example.org` was being
+scanned: the header shows `Paused 1/3`, the button changes to **▶ Resume**, a
+toast confirms *Batch will pause after the current site finishes*, and
+`shop.example.net` waits as *queued*.
+
 **Per-site controls** (on each chip):
 
 - **⏸** on a queued site — hold before that site starts; **▶** releases it.
@@ -177,15 +236,51 @@ success (green) / partial (amber, timed out) / scan failed (red, with reason).
 
 ### 4.4 The live console
 
+<img src="docs/media/console.png" alt="Live scan output console" width="300" align="right">
+
 **Scan output** shows WPScan's human-readable progress: the command (token
 masked), each enumeration phase, plugins and themes as they are found, and
 warnings. It auto-scrolls unless you scroll up, and has `wrap` / `clear`
 controls.
 
+How to read the lines:
+
+| Prefix | Meaning |
+|---|---|
+| `$` | The WPScan command being run (API token masked). |
+| `[+]` | Something found: the target URL, a plugin or theme, a user, or a summary. |
+| `[i]` | Information, e.g. *2 plugin(s) Identified* or *version could not be detected*. |
+| `[!]` | A vulnerability (`Title: …`) or a warning. |
+| `│` | Details of the item above: location, how it was found, version, *Fixed in*, references. |
+| `!! FAILED:` / `!! PARTIAL:` | The dashboard's own note when a site fails or times out. |
+
+<br clear="right">
+
 The console is **display-only**: it is held in memory, never stored in the
 database, never included in exports, and hidden when printing. It relies on
 WPScan's `--verbose` flag and a pseudo-terminal so output isn't buffered;
 disable it with `WPSCAN_VERBOSE=false`.
+
+### 4.5 Reviewing the results
+
+![Results after a scan](docs/media/results.png)
+
+When the batch ends, a toast summarizes it (succeeded / partial / failed /
+skipped) and the dashboard shows the final state:
+
+- **Summary band** — `3/3 sites scanned`, 13 open findings, and the severity
+  split (2 critical, 1 high, 5 medium, 2 low, 3 info).
+- **Site chips** — all green. `shop.example.net` was skipped by a **Cancel** in
+  this batch, so it keeps the result of its previous scan (WordPress 6.4.2)
+  rather than showing as failed.
+- **Findings table** — the critical *Elementor Pro < 4.2.2 Unauthenticated
+  Arbitrary File Upload* on two sites tops the list, with **Fixed in 4.2.2**
+  telling you exactly which update resolves it. Below it, an exposed
+  `wp-config` backup is tagged `exposure` with `no fix` (remove the file).
+
+Each site always shows the findings from its **latest** successful (or
+partial) scan. Re-scanning replaces them, so fixed issues disappear and nothing
+goes stale.
 
 ---
 
@@ -195,27 +290,63 @@ Click **Export PDF** or **Export JSON** in the header (or call
 `GET /api/export.pdf` / `GET /api/export.json`). Files are named
 `wpscan-audit-YYYYMMDD-HHMM.{pdf,json}`.
 
-<img src="docs/media/pdf-report.png" alt="PDF audit report, page 1" width="480" align="right">
+### 5.1 PDF report
 
-**PDF report** — a paginated audit deliverable:
+| Page 1 | Page 2 |
+|:---:|:---:|
+| <img src="docs/media/pdf-report.png" alt="PDF audit report, page 1" width="400"> | <img src="docs/media/pdf-report-page2.png" alt="PDF audit report, page 2" width="400"> |
 
-1. **Summary** — finding counts per severity with plain-language definitions.
-2. **Scope and coverage** — every target with status, WordPress version, last
-   scan time and finding count. Failed targets are flagged as *not assessed* and
-   partial (timed-out) targets as *incomplete*, so a coverage gap is never
-   mistaken for a clean result.
-3. **Findings** — ordered by severity, with critical and high rows tinted.
-4. **Method and caveats** — how severity was decided and what the report does
-   and doesn't prove.
+A paginated audit deliverable you can hand to a client or attach to a ticket:
 
-**JSON report** — the same data as structured fields (`report_type`,
-`generated_at`, `scope`, `summary`, `targets`, `findings`,
-`severity_definitions`, `notes`) for diffing runs or feeding a ticket tracker.
+1. **Header** — report title, generation time, how many targets were assessed,
+   and the total finding count.
+2. **Summary** — finding counts per severity, with a plain-language meaning
+   for each level (e.g. *critical: remote code execution or equivalent full
+   compromise; patch immediately*).
+3. **Scope and coverage** — every target with its status, WordPress version,
+   last scan time and number of findings. Failed targets are flagged as *not
+   assessed* and partial (timed-out) targets as *incomplete*, so a coverage gap
+   is never mistaken for a clean result.
+4. **Findings** — the full table ordered by severity, with critical rows tinted
+   red and high rows tinted orange. Each row has the finding, target, component
+   (with type), installed version, *fixed in* version and the CVE or reference.
+5. **Method and caveats** (page 2) — how severity was decided, and what the
+   report does and doesn't prove.
+
+Every page carries a footer with the report name and page number.
+
+### 5.2 JSON report
+
+The same data as structured fields, for diffing two runs or feeding a ticket
+tracker. An abridged example:
+
+```json
+{
+  "report_type": "WordPress security audit",
+  "generated_at": "2026-11-19T18:38:46+06:00",
+  "scope":   { "targets_total": 3, "targets_scanned": 3, "targets_partial": 0, "targets_failed": 0 },
+  "summary": { "critical": 2, "high": 1, "medium": 5, "low": 2, "info": 3, "total": 13 },
+  "targets": [ { "site": "https://blog.example.com", "status": "success", "findings": 5, "...": "..." } ],
+  "findings": [
+    {
+      "site": "https://blog.example.com",
+      "severity": "critical",
+      "title": "Elementor Pro < 4.2.2 - Unauthenticated Arbitrary File Upload via Upload Field Array Validation Bypass",
+      "component_type": "plugin",
+      "component_name": "elementor-pro",
+      "component_version": "3.20.0",
+      "fixed_in": "4.2.2",
+      "cves": [],
+      "references": []
+    }
+  ],
+  "severity_definitions": { "critical": "Remote code execution or equivalent full compromise. Patch immediately.", "...": "..." },
+  "notes": [ "Findings reflect the most recent successful scan of each target.", "..." ]
+}
+```
 
 PDF export needs `reportlab` (in `requirements.txt`). Without it the dashboard
 and JSON export still work, and the PDF button says reportlab is missing.
-
-<br clear="right">
 
 ---
 
@@ -268,6 +399,17 @@ severity as a prioritization aid, not a substitute for reading the advisory.
 ---
 
 ## 8. Troubleshooting
+
+![A failed target with its error](docs/media/scan-failed.png)
+
+When a target fails:
+
+1. Its **chip turns red** and says **scan failed**.
+2. **Click "scan failed"** to see the reason. Here WPScan aborted because the
+   site answered with HTTP 403, which usually means a WAF blocked the scan.
+3. Click **↻** on the chip to retry just that site once the cause is fixed.
+4. Findings from the site's last successful scan stay in the table. A failed
+   re-scan never erases them.
 
 | Symptom | What to do |
 |---|---|
