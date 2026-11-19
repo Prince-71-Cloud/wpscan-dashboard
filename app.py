@@ -70,7 +70,7 @@ def api_findings():
         "progress": manager.progress(),
         "events": manager.events.since(since),
         "last_event_id": manager.events.latest_id(),
-        "wpscan_keys_configured": scanner.build_keyring(CONFIG).count(),
+        "wpscan_keys_configured": scanner.configured_key_count(CONFIG),
     })
 
 
@@ -113,7 +113,6 @@ def api_settings():
         "PREFLIGHT_TIMEOUT": int,
         "WPSCAN_ENUMERATE": str,
         "WPSCAN_PLUGINS_DETECTION": str,
-        "MAX_CONCURRENT": int,
         "EXTRA_CHECKS": str,
         "WPSCAN_FORMAT": str,
     }

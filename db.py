@@ -24,7 +24,7 @@ _SCHEMA = """
 CREATE TABLE IF NOT EXISTS scans (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     site        TEXT NOT NULL,
-    status      TEXT NOT NULL,              -- queued|running|success|error|paused
+    status      TEXT NOT NULL,              -- queued|running|success|partial|error
     started_at  REAL,
     finished_at REAL,
     wp_version  TEXT,
@@ -50,8 +50,11 @@ CREATE TABLE IF NOT EXISTS findings (
     created_at        REAL
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_findings_dedup
-    ON findings(site, title, component_name);
+-- Older databases had a narrower unique key (site, title, component_name),
+-- which collided when a plugin and a theme shared a slug and a vuln title.
+DROP INDEX IF EXISTS idx_findings_dedup;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_findings_dedup_v2
+    ON findings(site, component_type, component_name, title);
 CREATE INDEX IF NOT EXISTS idx_findings_site     ON findings(site);
 CREATE INDEX IF NOT EXISTS idx_findings_severity ON findings(severity);
 """
@@ -92,6 +95,12 @@ class Database:
         with self._conn() as c:
             c.execute(f"UPDATE scans SET {cols} WHERE id = ?", (*fields.values(), scan_id))
 
+    def delete_scan_if_status(self, scan_id: int, status: str) -> None:
+        """Remove a scan row only if it is still in `status` (e.g. a 'queued'
+        placeholder for a site the batch never reached)."""
+        with self._conn() as c:
+            c.execute("DELETE FROM scans WHERE id = ? AND status = ?", (scan_id, status))
+
     def latest_scan_status(self) -> dict[str, dict[str, Any]]:
         """Most recent scan row per site, keyed by site."""
         with self._conn() as c:
@@ -110,9 +119,11 @@ class Database:
         now = time.time()
         with self._conn() as c:
             c.execute("DELETE FROM findings WHERE site = ?", (site,))
+            # OR IGNORE: a report can legitimately repeat a finding (same
+            # component + title); keep one instead of failing the whole save.
             c.executemany(
                 """
-                INSERT INTO findings
+                INSERT OR IGNORE INTO findings
                   (scan_id, site, finding_kind, component_type, component_name,
                    component_version, title, severity, cvss, fixed_in, cves, refs, created_at)
                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)

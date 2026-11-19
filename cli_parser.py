@@ -39,6 +39,12 @@ from parser import classify_severity
 
 # Section headers that change how following component blocks are interpreted.
 _SECTION_RE = re.compile(r"^\[i\]\s+(.*?)\s+Identified", re.IGNORECASE)
+# WPScan 4.x opens a section with "[+] Enumerating Vulnerable Plugins (...)"
+# and prints the "[i] 2 plugin(s) Identified." count AFTER the list, so the
+# count line must END a section, not start one.
+_ENUM_RE = re.compile(r"^\[\+\]\s+Enumerating\s+(.*)", re.IGNORECASE)
+_COUNT_RE = re.compile(r"^\[i\]\s+(\d+\s+.*Identified|No\s+.*Found)", re.IGNORECASE)
+_REMAINING_RE = re.compile(r"Requests Remaining:\s*(\d+)", re.IGNORECASE)
 _COMPONENT_RE = re.compile(r"^\[\+\]\s+(.+?)\s*$")
 _VERSION_RE = re.compile(r"Version:\s*([0-9][^\s(]*)")
 _WP_VERSION_RE = re.compile(r"WordPress version\s+([0-9][^\s]*)\s+identified", re.I)
@@ -133,6 +139,7 @@ class StreamingParser:
         self._cur_vulns:   list[dict[str, Any]] = []
         self._cur_vuln:    dict[str, Any] | None = None
         self._cur_outdated = False
+        self.requests_remaining: int | None = None
 
     def _emit(self, f: dict[str, Any]) -> None:
         self._findings.append(f)
@@ -181,13 +188,39 @@ class StreamingParser:
             self._cur_version    = self.wp_version
             return
 
+        # API quota left on the key ("| Requests Remaining: 23")
+        rm = _REMAINING_RE.search(raw)
+        if rm:
+            self.requests_remaining = int(rm.group(1))
+
         # Interesting findings header
         if raw.strip().lower().startswith("interesting finding"):
             self._flush()
             self._section_type = "interesting"
             return
 
-        # Section headers
+        # "[+] Enumerating ..." starts a section (WPScan 4.x layout)
+        em = _ENUM_RE.match(raw)
+        if em:
+            self._flush()
+            label = em.group(1).lower()
+            if "plugin" in label:
+                self._section_type = "plugin"
+            elif "theme" in label:
+                self._section_type = "theme"
+            elif "user" in label:
+                self._section_type = "user"
+            else:
+                self._section_type = None
+            return
+
+        # "[i] 2 plugin(s) Identified." / "[i] No themes Found." end a section
+        if _COUNT_RE.match(raw):
+            self._flush()
+            self._section_type = None
+            return
+
+        # Section headers ("[i] Plugin(s) Identified:" — older layout)
         sm = _SECTION_RE.search(raw)
         if sm:
             self._flush()
@@ -206,9 +239,10 @@ class StreamingParser:
         if (raw.startswith("[+] Finished") or raw.startswith("[+] Started")
                 or raw.startswith("[+] URL") or raw.startswith("[+] Requests")
                 or raw.startswith("[+] Data") or raw.startswith("[+] Elapsed")
-                or raw.startswith("[+] Memory")):
+                or raw.startswith("[+] Memory")
+                or raw.startswith("[+] WPScan DB API")):
             self._flush()
-            if raw.startswith("[+] Finished"):
+            if raw.startswith(("[+] Finished", "[+] WPScan DB API")):
                 self._section_type = None
             return
 
@@ -277,12 +311,15 @@ class StreamingParser:
         self._flush()
 
     def result(self) -> dict[str, Any]:
-        return {
+        out = {
             "site":       self.site.rstrip("/"),
             "wp_version": self.wp_version,
             "target_ip":  self.target_ip,
             "findings":   self._findings,
         }
+        if self.requests_remaining is not None:
+            out["requests_remaining"] = self.requests_remaining
+        return out
 
 
 def parse_cli(text: str, site_hint: str | None = None) -> dict[str, Any]:

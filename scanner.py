@@ -30,7 +30,6 @@ import ssl
 import subprocess
 import threading
 import time as time_module
-from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
 from typing import Any, Callable
 
@@ -45,16 +44,20 @@ _PARSEABLE_EXIT_CODES = {0, 5}
 # or on stderr) when the API key's daily request quota is spent. WPScan's exact
 # wording is "Your API limit has been reached". Matched case-insensitively.
 _RATE_LIMIT_MARKERS = (
-    "api limit", "plan limit", "request limit", "rate limit", "rate limit hit",
-    "limit has been reached", "throttl", "429", "too many requests",
+    "api limit", "plan limit", "request limit", "limit has been reached",
 )
+# Generic throttling words a *target site or WAF* can also produce; they only
+# count as a key problem when the message is about the API.
+_WEAK_RATE_LIMIT_MARKERS = ("rate limit", "throttl", "429", "too many requests")
 
 # WPScan's wording when a key is rejected outright: "The API token provided is
 # invalid". A bad key should be dropped and the next one tried, not treated as
-# a fatal scan error.
+# a fatal scan error. Bare status codes (401/403) are deliberately NOT markers:
+# they appear in WPScan's response-code stats and progress counters, and a WAF
+# 403 is not a key problem.
 _INVALID_KEY_MARKERS = (
     "token provided is invalid", "invalid api token", "invalid token",
-    "unauthorized", "401", "403",
+    "api token is invalid",
 )
 
 
@@ -84,7 +87,22 @@ class InvalidKeyError(KeyProblem):
 
 def _looks_like_rate_limit(message: str) -> bool:
     msg = (message or "").lower()
-    return any(marker in msg for marker in _RATE_LIMIT_MARKERS)
+    if any(marker in msg for marker in _RATE_LIMIT_MARKERS):
+        return True
+    return "api" in msg and any(m in msg for m in _WEAK_RATE_LIMIT_MARKERS)
+
+
+def _cli_error_lines(plain: str) -> str:
+    """Only the lines of cli output that can report a scan/API problem:
+    top-level '[!]' notices and 'Scan Aborted'. Excludes guttered vulnerability
+    blocks (' | [!] Title: ...'), progress bars and stats, which contain
+    numbers like 403/429 that must not be read as errors."""
+    picked = []
+    for ln in plain.splitlines():
+        s = ln.strip()
+        if "Scan Aborted" in s or (s.startswith("[!]") and "Title:" not in s):
+            picked.append(s)
+    return "\n".join(picked)
 
 
 def _looks_like_invalid_key(message: str) -> bool:
@@ -197,30 +215,39 @@ class KeyRing:
                     return key
             return None  # every key spent
 
+    def _seek_usable(self) -> str | None:
+        """Move the pointer onto the first usable key at or after it (without
+        advancing past it) and return that key; None if every key is spent.
+        Caller must hold the lock."""
+        n = len(self._keys)
+        for step in range(n):
+            pos = (self._idx + step) % n
+            if self._keys[pos] not in self._exhausted:
+                self._idx = pos
+                return self._keys[pos]
+        return None
+
     def current(self) -> str | None:
-        """Peek at the key the ring is pointing at, without claiming it."""
+        """The key in use: the first usable key at or after the pointer. Skips
+        exhausted keys, so it only returns None when every key is spent."""
         with self._lock:
             if not self._keys:
                 return None
-            cur = self._keys[self._idx]
-            return None if cur in self._exhausted else cur
+            return self._seek_usable()
 
     def report_exhausted(self, key: str) -> str | None:
         """
         Mark `key` unusable and return the next usable key (None if all spent).
-        Safe to call from multiple threads that hit the limit on the same key.
+        The pointer is left ON the returned key, so a following current() call
+        returns the same key. Safe to call from multiple threads that hit the
+        limit on the same key.
         """
         with self._lock:
             if key:
                 self._exhausted.add(key)
             if not self._keys:
                 return None
-            for _ in range(len(self._keys)):
-                candidate = self._keys[self._idx]
-                self._idx = (self._idx + 1) % len(self._keys)
-                if candidate not in self._exhausted:
-                    return candidate
-            return None
+            return self._seek_usable()
 
 
 def read_api_keys(path: str) -> list[str]:
@@ -349,6 +376,28 @@ def build_keyring(config: dict[str, Any]) -> KeyRing:
         keys.append(env_token)
     keys += read_api_keys(config.get("API_KEYS_FILE", "api_keys.txt"))
     return KeyRing(keys)
+
+
+_key_count_cache: dict[str, Any] = {"sig": None, "count": 0}
+_key_count_lock = threading.Lock()
+
+
+def configured_key_count(config: dict[str, Any]) -> int:
+    """Number of distinct configured API keys, for the UI. Cached on the key
+    file's mtime/size (and the env token) so the dashboard's frequent polling
+    doesn't re-read the file every time; edits are still picked up."""
+    path = config.get("API_KEYS_FILE", "api_keys.txt")
+    try:
+        st = os.stat(path)
+        file_sig = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        file_sig = None
+    sig = (path, file_sig, config.get("WPSCAN_API_TOKEN"))
+    with _key_count_lock:
+        if _key_count_cache["sig"] != sig:
+            _key_count_cache["count"] = build_keyring(config).count()
+            _key_count_cache["sig"] = sig
+        return _key_count_cache["count"]
 
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
@@ -643,10 +692,13 @@ def run_wpscan(
         if _looks_like_invalid_key(detail):
             raise InvalidKeyError(f"{url}: {detail}")
         raise WPScanError(f"{url}: Scan Aborted: {detail}")
-    if _looks_like_rate_limit(plain) and "vulns" not in plain.lower():
-        raise RateLimitError(f"{url}: {_extract_error_detail(plain)[:600]}")
-    if _looks_like_invalid_key(plain):
-        raise InvalidKeyError(f"{url}: {_extract_error_detail(plain)[:600]}")
+    # "[+] WPScan DB API OK" means the key was accepted for this scan.
+    if "wpscan db api ok" not in plain.lower():
+        err_lines = _cli_error_lines(plain)
+        if _looks_like_rate_limit(err_lines):
+            raise RateLimitError(f"{url}: {err_lines[:600]}")
+        if _looks_like_invalid_key(err_lines):
+            raise InvalidKeyError(f"{url}: {err_lines[:600]}")
 
     import cli_parser
     # StreamingParser was already fed each line live during PTY output if
@@ -799,12 +851,18 @@ def read_sites(path: str) -> list[str]:
     if not os.path.exists(path):
         return []
     sites: list[str] = []
+    seen: set[str] = set()
     with open(path, "r", encoding="utf-8") as fh:
         for line in fh:
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
-            sites.append(normalize_site(line))
+            site = normalize_site(line)
+            # A repeated target would be scanned twice and burn API quota.
+            if site in seen:
+                continue
+            seen.add(site)
+            sites.append(site)
     return sites
 
 
@@ -974,6 +1032,9 @@ class ScanManager:
                 self._paused_site = None
 
     def start_batch(self, sites: list[str]) -> bool:
+        # De-duplicate (order kept) so no target is scanned twice, whatever the
+        # caller passed — sites.txt or an API body.
+        sites = list(dict.fromkeys(sites))
         with self._lock:
             if self._running:
                 return False
@@ -1001,6 +1062,7 @@ class ScanManager:
 
     def _run_batch(self, sites: list[str]) -> None:
         started = time_module.time()
+        scan_ids: dict[str, int] = {}
         try:
             self._keyring = build_keyring(self.config)
             self.log.clear()
@@ -1012,7 +1074,7 @@ class ScanManager:
                 level="info",
             )
             # Sites run one at a time — sequential, predictable, cheap on API quota.
-            scan_ids = {s: self.db.create_scan(s, status="queued") for s in sites}
+            scan_ids.update({s: self.db.create_scan(s, status="queued") for s in sites})
             for idx, site in enumerate(sites, 1):
                 # Honour per-site pause (set by the UI before this site starts).
                 if not self._wait_if_paused(site):
@@ -1032,20 +1094,34 @@ class ScanManager:
                                      "Batch cancelled by user.", level="warn")
                     return
         finally:
+            # Sites the batch never reached (cancelled) still hold a 'queued'
+            # placeholder row. Drop it so each site falls back to its last real
+            # status instead of showing — and exporting — a phantom 'queued'.
+            skipped = set()
+            for s, sid in scan_ids.items():
+                before = self.db.latest_scan_status().get(s, {})
+                if before.get("id") == sid and before.get("status") == "queued":
+                    skipped.add(s)
+                self.db.delete_scan_if_status(sid, "queued")
             with self._lock:
                 self._running = False
                 self._current_site = None
                 done = self._done
             elapsed = int(time_module.time() - started)
             statuses = self.db.latest_scan_status()
-            ok = sum(1 for s in sites if statuses.get(s, {}).get("status") == "success")
-            failed = len(sites) - ok
+            st_of = {s: statuses.get(s, {}).get("status")
+                     for s in sites if s not in skipped}
+            ok = sum(1 for v in st_of.values() if v == "success")
+            partial = sum(1 for v in st_of.values() if v == "partial")
+            failed = len(st_of) - ok - partial
             total_findings = len(self.db.all_findings())
             msg = (f"Scan complete — {ok}/{len(sites)} target(s) succeeded"
+                   + (f", {partial} partial (timed out)" if partial else "")
                    + (f", {failed} failed" if failed else "")
+                   + (f", {len(skipped)} skipped (cancelled)" if skipped else "")
                    + f". {total_findings} finding(s) in {elapsed}s.")
             self.events.emit("scan_complete", msg,
-                             level="warn" if failed else "success")
+                             level="warn" if (failed or partial) else "success")
 
     def _scan_one(self, site: str, scan_id: int, index: int = 1, total: int = 1) -> None:
         import time
@@ -1120,20 +1196,7 @@ class ScanManager:
                 )
                 wp_findings = parsed["findings"]
 
-                # Add passive web-hygiene checks (headers, CORS, TLS, exposed
-                # files, directory listing, REST user enumeration) that WPScan
-                # doesn't cover. Optional and best-effort — never fail the scan.
-                extra_findings: list[dict[str, Any]] = []
-                if _truthy(self.config.get("EXTRA_CHECKS", True)):
-                    try:
-                        import checks
-                        extra_findings = checks.run_passive_checks(
-                            parsed["site"],
-                            timeout=int(self.config.get("CHECK_TIMEOUT", 10)),
-                        )
-                    except Exception:  # noqa: BLE001 — hygiene checks are optional
-                        extra_findings = []
-
+                extra_findings = self._hygiene_findings(parsed["site"] or site)
                 all_findings = wp_findings + extra_findings
                 self.db.replace_findings(parsed["site"], scan_id, all_findings)
                 self.db.update_scan(
@@ -1188,6 +1251,10 @@ class ScanManager:
             except PartialScanError as exc:
                 # Timeout with partial findings — save what we have.
                 partial = exc.partial
+                # The host answered WPScan, so the bounded hygiene checks are
+                # still worth running to make the partial result more complete.
+                extra_findings = self._hygiene_findings(partial["site"] or site)
+                partial["findings"] = partial["findings"] + extra_findings
                 self.db.replace_findings(partial["site"] or site, scan_id,
                                          partial["findings"])
                 self.db.update_scan(
@@ -1238,6 +1305,19 @@ class ScanManager:
                          level="error")
         self._mark_done()
 
+    def _hygiene_findings(self, site: str) -> list[dict[str, Any]]:
+        """Passive web-hygiene checks (headers, CORS, TLS, exposed files,
+        directory listing, REST user enumeration) that WPScan doesn't cover.
+        Optional and best-effort — never fails the scan."""
+        if not _truthy(self.config.get("EXTRA_CHECKS", True)):
+            return []
+        try:
+            import checks
+            return checks.run_passive_checks(
+                site, timeout=int(self.config.get("CHECK_TIMEOUT", 10)))
+        except Exception:  # noqa: BLE001 — hygiene checks are optional
+            return []
+
     def _mark_done(self) -> None:
         with self._lock:
             self._done += 1
@@ -1262,9 +1342,11 @@ def ingest_directory(db: Database, directory: str) -> int:
                            wp_version=parsed.get("wp_version"),
                            target_ip=parsed.get("target_ip"))
             count += 1
-        except WPScanError as exc:
+        except Exception as exc:  # noqa: BLE001 — one bad file mustn't abort the ingest
+            msg = str(exc) if isinstance(exc, WPScanError) else (
+                f"Could not ingest {name}: {type(exc).__name__}: {exc}")
             sid = db.create_scan(name, status="error", source="ingest")
-            db.update_scan(sid, error=str(exc), finished_at=time.time())
+            db.update_scan(sid, error=msg, finished_at=time.time())
     return count
 
 

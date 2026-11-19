@@ -55,8 +55,13 @@ async function load() {
     state.lastEventId = data.last_event_id || 0;
     state.primed = true;
   } else if (data.events && data.events.length) {
-    for (const ev of data.events) showToast(ev.message, ev.level, ev.kind);
-    state.lastEventId = data.events[data.events.length - 1].id;
+    // Button handlers call load() while a scheduled poll may already be in
+    // flight; both responses carry the same events, so skip any already shown.
+    for (const ev of data.events) {
+      if (ev.id <= state.lastEventId) continue;
+      showToast(ev.message, ev.level, ev.kind);
+      state.lastEventId = ev.id;
+    }
   }
 
   renderPosture(data.summary || {});
@@ -577,7 +582,6 @@ async function openSettings() {
     $("#s-timeout-val").textContent = fmtTimeout(cfg.SCAN_TIMEOUT ?? 1800);
     $("#s-detection").value         = cfg.WPSCAN_PLUGINS_DETECTION ?? "aggressive";
     $("#s-enumerate").value         = cfg.WPSCAN_ENUMERATE ?? "vp,vt,u,cb,dbe";
-    $("#s-concurrent").value        = cfg.MAX_CONCURRENT ?? 3;
   } catch { /* use whatever values are already in the inputs */ }
   $("#settings-panel").hidden = false;
   $("#btn-settings").setAttribute("aria-pressed", "true");
@@ -604,7 +608,6 @@ $("#settings-save").addEventListener("click", async () => {
     PREFLIGHT_TIMEOUT:     Number($("#s-preflight-timeout").value),
     WPSCAN_PLUGINS_DETECTION: $("#s-detection").value,
     WPSCAN_ENUMERATE:      $("#s-enumerate").value.trim(),
-    MAX_CONCURRENT:        Number($("#s-concurrent").value),
   };
   try {
     const r = await fetch("/api/settings", {

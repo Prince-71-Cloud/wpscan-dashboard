@@ -75,7 +75,10 @@ def build_report(db, config: dict[str, Any] | None = None) -> dict[str, Any]:
 
     summary = summarize(findings)
     scanned_ok = sum(1 for t in targets if t["status"] == "success")
-    failed = [t for t in targets if t["status"] not in ("success", None)]
+    # A timed-out scan saved real findings, so it is partially assessed — not
+    # a failure, but not a complete result either.
+    partial = sum(1 for t in targets if t["status"] == "partial")
+    failed = [t for t in targets if t["status"] not in ("success", "partial", None)]
 
     return {
         "report_type": "WordPress security audit",
@@ -84,6 +87,7 @@ def build_report(db, config: dict[str, Any] | None = None) -> dict[str, Any]:
         "scope": {
             "targets_total": len(targets),
             "targets_scanned": scanned_ok,
+            "targets_partial": partial,
             "targets_failed": len(failed),
         },
         "summary": summary,
@@ -96,6 +100,8 @@ def build_report(db, config: dict[str, Any] | None = None) -> dict[str, Any]:
             "available; otherwise it is classified from the vulnerability type.",
             "A target that failed to scan has NOT been assessed — treat its "
             "status as unknown rather than clean.",
+            "A 'partial' target timed out mid-scan: its findings are real but "
+            "incomplete, so absence of a finding there proves nothing.",
         ],
     }
 
@@ -161,10 +167,13 @@ def build_pdf(report: dict[str, Any]) -> bytes:
 
     # ---- Header ---------------------------------------------------------- #
     story.append(Paragraph("WordPress Security Audit", h1))
+    n_partial = scope.get("targets_partial", 0)
     story.append(Paragraph(
         f"Generated {report.get('generated_at', '')} &nbsp;·&nbsp; "
         f"{scope.get('targets_scanned', 0)} of {scope.get('targets_total', 0)} "
-        f"target(s) assessed &nbsp;·&nbsp; {summary.get('total', 0)} finding(s)",
+        f"target(s) assessed"
+        + (f" ({n_partial} more partially)" if n_partial else "")
+        + f" &nbsp;·&nbsp; {summary.get('total', 0)} finding(s)",
         sub))
 
     # ---- Severity summary ------------------------------------------------ #
@@ -196,9 +205,9 @@ def build_pdf(report: dict[str, Any]) -> bytes:
     rows = [[Paragraph(f"<b>{c}</b>", cell) for c in
              ("Target", "Status", "WP version", "Last scan", "Findings")]]
     for tgt in report.get("targets", []):
-        ok = tgt.get("status") == "success"
-        status_txt = (tgt.get("status") or "not scanned").replace("_", " ")
-        color = "#1a7f4b" if ok else "#c0182b"
+        status = tgt.get("status")
+        status_txt = (status or "not scanned").replace("_", " ")
+        color = {"success": "#1a7f4b", "partial": "#b58900"}.get(status, "#c0182b")
         rows.append([
             Paragraph(tgt.get("site", ""), cell),
             Paragraph(f"<font color='{color}'>{status_txt}</font>", cell),
@@ -221,7 +230,18 @@ def build_pdf(report: dict[str, Any]) -> bytes:
 
     # A failed scan is a coverage gap, not a clean bill of health.
     failed = [t_ for t_ in report.get("targets", [])
-              if t_.get("status") not in ("success", None)]
+              if t_.get("status") not in ("success", "partial", None)]
+    partial = [t_ for t_ in report.get("targets", [])
+               if t_.get("status") == "partial"]
+    if partial:
+        story.append(Spacer(1, 5))
+        story.append(Paragraph(
+            "<b>Note:</b> the following target(s) timed out mid-scan; their "
+            "findings are real but coverage is incomplete.", note))
+        for t_ in partial:
+            story.append(Paragraph(
+                f"• {t_.get('site')} — {(t_.get('error') or 'scan timed out')[:220]}",
+                small))
     if failed:
         story.append(Spacer(1, 5))
         story.append(Paragraph(
