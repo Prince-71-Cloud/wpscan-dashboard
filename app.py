@@ -13,11 +13,32 @@ Routes:
   GET  /api/export.json      full audit report as JSON (download)
   GET  /api/export.pdf       full audit report as PDF (download)
   POST /api/clear            wipe all stored scans and findings
+
+Security model: there is no login. The dashboard is meant to be bound to
+loopback and used by one operator, so the browser is the only thing that can
+reach it — which makes the browser the attack surface. Three guards keep a
+hostile web page from driving the API through the operator's own browser:
+
+  * Every state-changing request must carry `X-Requested-With`. A cross-site
+    form or no-cors fetch cannot set custom headers, and a CORS preflight for
+    one is never answered, so drive-by POSTs (clear the DB, launch a scan of
+    the real targets) are refused.
+  * `Origin` / `Sec-Fetch-Site`, when the browser sends them, must match.
+  * `TRUSTED_HOSTS` rejects requests whose Host header is not the dashboard's
+    own, which defeats DNS rebinding (a page resolving its own name to
+    127.0.0.1 to read findings about client sites).
+
+Every scan/ingest/clear/settings action is appended to AUDIT_LOG with the
+caller's address, so there is a record of what was run against which target.
 """
 
 from __future__ import annotations
 
 import json
+import logging
+import re
+import sys
+from urllib.parse import urlparse
 
 from flask import Flask, jsonify, make_response, render_template, request
 
@@ -30,6 +51,93 @@ from parser import SEVERITY_ORDER, SEVERITY_RANK, summarize
 app = Flask(__name__)
 db = Database(CONFIG["DATABASE"])
 manager = scanner.ScanManager(db, CONFIG)
+
+_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1", "[::1]")
+
+
+def _trusted_hosts() -> list[str]:
+    hosts = list(_LOOPBACK_HOSTS)
+    bind = (CONFIG.get("HOST") or "").strip()
+    if bind and bind not in ("0.0.0.0", "::", "[::]"):
+        hosts.append(bind)
+    for extra in (CONFIG.get("TRUSTED_HOSTS") or "").split(","):
+        extra = extra.strip()
+        if extra:
+            hosts.append(extra)
+    return hosts
+
+
+# Werkzeug compares the Host header (port stripped) against this list and
+# answers 400 to anything else.
+app.config["TRUSTED_HOSTS"] = _trusted_hosts()
+app.config["MAX_CONTENT_LENGTH"] = 256 * 1024  # API bodies are tiny
+
+
+# --------------------------------------------------------------------------- #
+# Audit log
+# --------------------------------------------------------------------------- #
+_audit = logging.getLogger("wpscan.audit")
+_audit.setLevel(logging.INFO)
+_audit.propagate = False
+if CONFIG.get("AUDIT_LOG") and not _audit.handlers:
+    try:
+        _h = logging.FileHandler(CONFIG["AUDIT_LOG"], encoding="utf-8")
+        _h.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+        _audit.addHandler(_h)
+    except OSError as exc:  # unwritable path: keep running, say so once
+        print(f" ! audit log {CONFIG['AUDIT_LOG']} not writable: {exc}",
+              file=sys.stderr)
+
+
+def audit(action: str, **fields) -> None:
+    """One line per operator action: who (remote address), what, on which
+    targets. The log is append-only evidence of what this tool was told to do."""
+    who = request.remote_addr if request else "-"
+    detail = " ".join(f"{k}={json.dumps(v, default=str)}" for k, v in fields.items())
+    _audit.info(f"{action} from={who} {detail}".rstrip())
+
+
+# --------------------------------------------------------------------------- #
+# Request guards and response headers
+# --------------------------------------------------------------------------- #
+_SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+
+
+@app.before_request
+def _reject_cross_site_writes():
+    if request.method in _SAFE_METHODS:
+        return None
+    if request.headers.get("X-Requested-With") != "XMLHttpRequest":
+        return jsonify({"error": "Cross-site request blocked: missing "
+                                 "X-Requested-With header."}), 403
+    origin = request.headers.get("Origin")
+    if origin and origin != "null":
+        if urlparse(origin).netloc.lower() != request.host.lower():
+            return jsonify({"error": "Cross-site request blocked: Origin "
+                                     "does not match."}), 403
+    elif origin == "null":
+        return jsonify({"error": "Cross-site request blocked: opaque Origin."}), 403
+    fetch_site = request.headers.get("Sec-Fetch-Site")
+    if fetch_site and fetch_site not in ("same-origin", "none"):
+        return jsonify({"error": "Cross-site request blocked."}), 403
+    return None
+
+
+@app.after_request
+def _security_headers(resp):
+    # The dashboard checks targets for these; it should pass its own audit.
+    resp.headers.setdefault("Content-Security-Policy",
+                            "default-src 'self'; img-src 'self' data:; "
+                            "object-src 'none'; base-uri 'none'; "
+                            "frame-ancestors 'none'; form-action 'self'")
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("Referrer-Policy", "no-referrer")
+    resp.headers.setdefault("Permissions-Policy",
+                            "camera=(), microphone=(), geolocation=()")
+    if request.path.startswith("/api/"):
+        resp.headers.setdefault("Cache-Control", "no-store")
+    return resp
 
 
 @app.route("/")
@@ -74,58 +182,131 @@ def api_findings():
     })
 
 
+_MAX_BATCH = 1000
+
+
 @app.route("/api/scan", methods=["POST"])
 def api_scan():
-    body = request.json if request.is_json else None
-    sites = None
-    if body:
-        # Accept either {"sites": [...]} or {"site": "..."} (single retry).
-        sites = body.get("sites")
-        if not sites and body.get("site"):
-            sites = [body["site"]]
-    if sites:
+    body = request.get_json(silent=True)
+    body = body if isinstance(body, dict) else {}
+    requested = body.get("sites")
+    if not requested and body.get("site"):
+        requested = [body["site"]]
+
+    configured = scanner.read_sites(CONFIG["SITES_FILE"])
+    if requested:
+        if not isinstance(requested, list) or len(requested) > _MAX_BATCH:
+            return jsonify({"error": "sites must be a list of at most "
+                                     f"{_MAX_BATCH} URLs."}), 400
         # Normalize the same way sites.txt is read, so a retry matches the
         # stored target exactly (scheme added, trailing slash trimmed).
-        sites = [scanner.normalize_site(s) for s in sites if s and s.strip()]
+        sites = [scanner.normalize_site(s) for s in requested
+                 if isinstance(s, str) and s.strip()]
+        # Only targets the operator has already listed (sites.txt) or
+        # previously scanned may be retried. Without this, anyone who can reach
+        # the port could point WPScan at arbitrary hosts.
+        allowed = set(configured) | set(db.latest_scan_status())
+        unknown = [s for s in sites if s not in allowed]
+        if unknown:
+            return jsonify({"error": "Target(s) not in sites.txt or scan "
+                                     "history; add them to sites.txt first.",
+                            "rejected": unknown}), 400
     else:
-        sites = scanner.read_sites(CONFIG["SITES_FILE"])
+        sites = configured
     if not sites:
         return jsonify({"error": f"No sites found in {CONFIG['SITES_FILE']}."}), 400
     if not manager.start_batch(sites):
         return jsonify({"error": "A scan batch is already running."}), 409
+    audit("scan_start", count=len(sites), targets=sites)
     return jsonify({"started": True, "count": len(sites)})
 
 
 @app.route("/api/ingest-samples", methods=["POST"])
 def api_ingest_samples():
     count = scanner.ingest_directory(db, CONFIG["SAMPLE_DIR"])
+    audit("ingest_samples", directory=CONFIG["SAMPLE_DIR"], ingested=count)
     if count == 0:
         return jsonify({"error": f"No JSON reports found in {CONFIG['SAMPLE_DIR']}."}), 400
     return jsonify({"ingested": count})
 
 
+# Runtime-editable settings and the validation each one gets. Values are
+# handed to the wpscan argv and to socket timeouts, so bounds matter: a
+# negative timeout raises inside the batch thread and an unknown --format
+# just fails every scan.
+_ENUMERATE_RE = re.compile(r"^[a-z]{1,3}(?:\d+(?:-\d+)?)?(?:,[a-z]{1,3}(?:\d+(?:-\d+)?)?)*$")
+_SETTING_RULES: dict[str, tuple] = {
+    "SCAN_TIMEOUT":             ("int", 60, 86400),
+    "PREFLIGHT_CHECK":          ("bool",),
+    "PREFLIGHT_TIMEOUT":        ("int", 1, 120),
+    "WPSCAN_ENUMERATE":         ("regex", _ENUMERATE_RE),
+    "WPSCAN_PLUGINS_DETECTION": ("choice", ("passive", "mixed", "aggressive")),
+    "EXTRA_CHECKS":             ("bool",),
+    "WPSCAN_FORMAT":            ("choice", ("cli-no-colour", "cli-no-color",
+                                            "cli", "json")),
+    "WPSCAN_THROTTLE":          ("int", 0, 60000),
+    "WPSCAN_MAX_THREADS":       ("int", 0, 50),
+}
+
+
+def _validate_setting(key: str, raw) -> tuple[object | None, str | None]:
+    """Return (value, None) or (None, reason)."""
+    rule = _SETTING_RULES[key]
+    kind = rule[0]
+    if kind == "int":
+        try:
+            val = int(raw)
+        except (TypeError, ValueError):
+            return None, "must be an integer"
+        if not rule[1] <= val <= rule[2]:
+            return None, f"must be between {rule[1]} and {rule[2]}"
+        return val, None
+    if kind == "bool":
+        if isinstance(raw, bool):
+            return ("true" if raw else "false"), None
+        txt = str(raw).strip().lower()
+        if txt in ("true", "1", "yes", "on"):
+            return "true", None
+        if txt in ("false", "0", "no", "off"):
+            return "false", None
+        return None, "must be true or false"
+    if kind == "choice":
+        txt = str(raw).strip().lower()
+        if txt not in rule[1]:
+            return None, f"must be one of {', '.join(rule[1])}"
+        return txt, None
+    if kind == "regex":
+        txt = str(raw).strip().lower()
+        if not rule[1].match(txt):
+            return None, "must be WPScan enumerate flags, e.g. vp,vt,u,cb,dbe"
+        return txt, None
+    return None, "unknown setting"
+
+
 @app.route("/api/settings", methods=["GET", "POST"])
 def api_settings():
     """Read or update runtime scan settings without restarting the server."""
-    editable = {
-        "SCAN_TIMEOUT": int,
-        "PREFLIGHT_CHECK": str,
-        "PREFLIGHT_TIMEOUT": int,
-        "WPSCAN_ENUMERATE": str,
-        "WPSCAN_PLUGINS_DETECTION": str,
-        "EXTRA_CHECKS": str,
-        "WPSCAN_FORMAT": str,
-    }
     if request.method == "POST":
-        body = request.get_json(silent=True) or {}
-        for key, cast in editable.items():
+        body = request.get_json(silent=True)
+        body = body if isinstance(body, dict) else {}
+        accepted: dict[str, object] = {}
+        invalid: dict[str, str] = {}
+        for key in _SETTING_RULES:
             if key in body:
-                try:
-                    CONFIG[key] = cast(body[key])
-                except (ValueError, TypeError):
-                    pass
-        return jsonify({"saved": True, "settings": {k: CONFIG[k] for k in editable}})
-    return jsonify({k: CONFIG[k] for k in editable})
+                val, why = _validate_setting(key, body[key])
+                if why:
+                    invalid[key] = why
+                else:
+                    accepted[key] = val
+        if invalid:
+            # All-or-nothing: a half-applied settings change is confusing.
+            return jsonify({"error": "Invalid settings.", "invalid": invalid}), 400
+        CONFIG.update(accepted)
+        if accepted:
+            audit("settings", changed=accepted)
+        return jsonify({"saved": True,
+                        "settings": {k: CONFIG[k] for k in _SETTING_RULES}})
+    return jsonify({k: CONFIG[k] for k in _SETTING_RULES})
 
 
 @app.route("/api/pause", methods=["POST"])
@@ -134,6 +315,7 @@ def api_pause():
     if not manager.is_running():
         return jsonify({"error": "No scan running."}), 400
     manager.pause()
+    audit("pause")
     return jsonify({"paused": True})
 
 
@@ -141,6 +323,7 @@ def api_pause():
 def api_resume():
     """Resume a paused batch."""
     manager.resume()
+    audit("resume")
     return jsonify({"resumed": True})
 
 
@@ -148,6 +331,7 @@ def api_resume():
 def api_cancel():
     """Cancel the batch after the current site finishes."""
     manager.cancel()
+    audit("cancel")
     return jsonify({"cancelled": True})
 
 
@@ -155,9 +339,10 @@ def api_cancel():
 def api_pause_site():
     """Pause before scanning a specific site (queues a hold for that site)."""
     site = (request.get_json(silent=True) or {}).get("site", "")
-    if not site:
+    if not site or not isinstance(site, str):
         return jsonify({"error": "site required"}), 400
     manager.pause_site(scanner.normalize_site(site))
+    audit("pause_site", site=site)
     return jsonify({"paused_site": site})
 
 
@@ -165,7 +350,10 @@ def api_pause_site():
 def api_resume_site():
     """Resume a per-site pause."""
     site = (request.get_json(silent=True) or {}).get("site", "")
+    if not isinstance(site, str):
+        return jsonify({"error": "site required"}), 400
     manager.resume_site(scanner.normalize_site(site))
+    audit("resume_site", site=site)
     return jsonify({"resumed_site": site})
 
 
@@ -187,6 +375,7 @@ def api_scan_log():
 @app.route("/api/export.json")
 def api_export_json():
     payload = report.build_report(db, CONFIG)
+    audit("export", format="json")
     resp = make_response(json.dumps(payload, indent=2, sort_keys=False))
     resp.headers["Content-Type"] = "application/json; charset=utf-8"
     resp.headers["Content-Disposition"] = (
@@ -202,6 +391,7 @@ def api_export_pdf():
     except report.PdfUnavailable as exc:
         # Degrade with an actionable message rather than a 500.
         return jsonify({"error": str(exc)}), 501
+    audit("export", format="pdf")
     resp = make_response(pdf_bytes)
     resp.headers["Content-Type"] = "application/pdf"
     resp.headers["Content-Disposition"] = (
@@ -212,11 +402,19 @@ def api_export_pdf():
 @app.route("/api/clear", methods=["POST"])
 def api_clear():
     db.clear()
+    audit("clear")
     return jsonify({"cleared": True})
 
 
 if __name__ == "__main__":
-    print(f" * WPScan dashboard on http://{CONFIG['HOST']}:{CONFIG['PORT']}")
+    host = CONFIG["HOST"]
+    if host not in _LOOPBACK_HOSTS and not scanner._truthy(CONFIG.get("ALLOW_REMOTE_BIND")):
+        print(f" ! Refusing to bind to {host}: the dashboard has no authentication "
+              f"and exposes scan controls and client findings to anyone who can "
+              f"reach it. Put it behind an authenticating reverse proxy and set "
+              f"ALLOW_REMOTE_BIND=true to override.", file=sys.stderr)
+        sys.exit(2)
+    print(f" * WPScan dashboard on http://{host}:{CONFIG['PORT']}")
     _key_count = scanner.build_keyring(CONFIG).count()
     if _key_count:
         print(f" * {_key_count} WPScan API key(s) loaded from "
@@ -225,4 +423,4 @@ if __name__ == "__main__":
         print(f" * No WPScan API keys — add them to {CONFIG['API_KEYS_FILE']} for "
               f"full vuln data (free keys at https://wpscan.com/profile).")
         print(" * Tip: click 'Load sample data' in the UI to try it immediately.")
-    app.run(host=CONFIG["HOST"], port=CONFIG["PORT"], debug=False, threaded=True)
+    app.run(host=host, port=CONFIG["PORT"], debug=False, threaded=True)

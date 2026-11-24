@@ -362,17 +362,27 @@ threads) with `WPSCAN_EXTRA_ARGS`.
 **Passive web-hygiene checks** (after each successful or partial scan; toggle
 with `EXTRA_CHECKS`):
 
-- missing security headers (CSP, X-Frame-Options, HSTS, …) and permissive CORS
-- HTTP vs HTTPS and weak TLS protocols
+- missing security headers (CSP, X-Frame-Options, HSTS, …), HSTS `max-age` /
+  `includeSubDomains` quality, and `Server` / `X-Powered-By` version disclosure
+- permissive CORS (`*` on the homepage) and REST-API Origin reflection
+  (`/wp-json/` is probed with a foreign `Origin`)
+- HTTP vs HTTPS, plain HTTP served without a redirect, certificate validity and
+  expiry, and whether legacy TLS 1.0 / 1.1 are still accepted (each version is
+  probed explicitly)
+- cookies set by `/wp-login.php` without `Secure` / `HttpOnly` / `SameSite`
 - directory listing
 - REST-API user enumeration (`/wp-json/wp/v2/users`)
 - a reachable admin login page
 - a small curated set of commonly exposed files (`/wp-content/debug.log`,
-  `/_wpeprivate/config.json`, `wp-config` backups, `.env`, `readme.html`,
-  `xmlrpc.php`)
+  `/_wpeprivate/config.json`, `wp-config` backups, `.env`, `/.git/HEAD`,
+  `readme.html`, `xmlrpc.php`)
 
 These are unauthenticated GET requests and header inspection only — bounded,
-rate-limited and gentle on the target.
+rate-limited and gentle on the target. File probes never follow redirects, and
+an "exposed file" is only reported when the body actually looks like that file
+(a `wp-config` backup must contain `DB_PASSWORD`, a `.env` must contain
+`KEY=value` lines, and so on), so a site that answers 200 to every URL does not
+produce false criticals in the report.
 
 **Deliberately not included:** credential brute-forcing / password spraying and
 active exploitation. They cause lockouts and outages, and automating them into a
@@ -388,13 +398,23 @@ WPScan's free feed rarely includes a CVSS score, so severity is layered:
 
 1. An explicit **CVSS score** is used when present (standard bands).
 2. Otherwise **keywords in the title** decide (e.g. *remote code execution* /
-   *unauthenticated arbitrary file upload* → critical, *SQL injection* → high,
-   *XSS* → medium).
-3. Any other known vulnerability defaults to **medium**.
+   *unauthenticated arbitrary file upload* / *unauthenticated SQL injection* /
+   *arbitrary plugin installation* → critical, *SQL injection* / *privilege
+   escalation* → high, *XSS* → medium).
+3. A vulnerability that needs an **Admin+** (or Super Admin+) account is capped
+   at **medium**: that role can already install arbitrary code.
+4. Any other known vulnerability defaults to **medium**.
 
 Exposures outside the vulnerability model (exposed `wp-config` backups, database
-dumps, debug logs, user enumeration) have their own fixed severities. Treat
-severity as a prioritization aid, not a substitute for reading the advisory.
+dumps, debug logs, user enumeration) have their own fixed severities. When
+WPScan's advisory lists a public exploit (Exploit-DB, Metasploit, Packet Storm)
+the link is kept and the table shows an **exploit available** badge — use it to
+order remediation. Treat severity as a prioritization aid, not a substitute for
+reading the advisory.
+
+A scan whose API key runs out of daily requests part-way through is recorded as
+**partial**, not success: WPScan silently returns no vulnerability data for the
+components it checks after the quota is gone, so the result is incomplete.
 
 ---
 
@@ -433,7 +453,9 @@ All settings are environment variables (see `config.py`):
 | `WPSCAN_PLUGINS_DETECTION` | `aggressive` | `passive` / `mixed` / `aggressive` |
 | `WPSCAN_VERBOSE` | `true` | Stream live progress to the console |
 | `WPSCAN_FORMAT` | `cli-no-colour` | WPScan output format; CLI output enables live findings |
-| `WPSCAN_EXTRA_ARGS` | *(none)* | Extra raw WPScan args, e.g. `--throttle 500` |
+| `WPSCAN_THROTTLE` | `0` | Milliseconds between WPScan requests (forces one thread); be gentle on production sites |
+| `WPSCAN_MAX_THREADS` | *(wpscan default)* | WPScan `--max-threads`, ignored when a throttle is set |
+| `WPSCAN_EXTRA_ARGS` | *(none)* | Extra raw WPScan args (advanced) |
 | `PREFLIGHT_CHECK` | `true` | Check reachability and WordPress fingerprint first |
 | `PREFLIGHT_TIMEOUT` | `10` | Pre-flight timeout (seconds) |
 | `EXTRA_CHECKS` | `true` | Run passive web-hygiene checks after each scan |
@@ -445,6 +467,15 @@ All settings are environment variables (see `config.py`):
 | `SCAN_TIMEOUT` | `1800` | Per-site scan timeout (seconds) |
 | `SAMPLE_DIR` | `sample_scans` | Directory of JSON reports to ingest |
 | `HOST` / `PORT` | `127.0.0.1` / `5000` | Bind address |
+| `ALLOW_REMOTE_BIND` | `false` | `python app.py` refuses a non-loopback `HOST` unless this is `true` (there is no login) |
+| `TRUSTED_HOSTS` | *(loopback + HOST)* | Extra `Host` header values to accept, comma separated; anything else gets HTTP 400 (DNS-rebinding guard) |
+| `AUDIT_LOG` | `audit.log` | Append-only log of scan / clear / settings / export actions with the caller's address |
+
+`SCAN_TIMEOUT`, `PREFLIGHT_*`, `EXTRA_CHECKS`, `WPSCAN_ENUMERATE`,
+`WPSCAN_PLUGINS_DETECTION`, `WPSCAN_FORMAT`, `WPSCAN_THROTTLE` and
+`WPSCAN_MAX_THREADS` can also be changed at runtime through the settings panel
+or `POST /api/settings`; values are range- and choice-checked and an invalid
+request changes nothing.
 
 ---
 
@@ -454,7 +485,7 @@ All settings are environment variables (see `config.py`):
 |---|---|---|
 | GET | `/` | Dashboard page |
 | GET | `/api/findings` | All findings, severity summary and per-site status |
-| POST | `/api/scan` | Start a batch from `sites.txt`; body `{ "site": "https://example.com" }` retries one site |
+| POST | `/api/scan` | Start a batch from `sites.txt`; body `{ "site": "https://example.com" }` retries one site (must already be in `sites.txt` or scan history) |
 | POST | `/api/ingest-samples` | Load JSON reports from `SAMPLE_DIR` |
 | GET/POST | `/api/settings` | Read or update runtime scan settings |
 | POST | `/api/pause`, `/api/resume`, `/api/cancel` | Pause between sites, resume, or cancel the batch |
@@ -463,6 +494,16 @@ All settings are environment variables (see `config.py`):
 | GET | `/api/export.json` | Full audit report as JSON (download) |
 | GET | `/api/export.pdf` | Full audit report as PDF (download) |
 | POST | `/api/clear` | Wipe stored scans and findings |
+
+Every `POST` must carry the header `X-Requested-With: XMLHttpRequest` (the
+dashboard adds it) and, when the browser sends one, a same-origin `Origin`.
+Requests without it are answered `403`. This is what stops a malicious web page
+from driving the API through your browser (clearing data, launching scans of
+your real targets). From `curl`:
+
+```bash
+curl -X POST -H 'X-Requested-With: XMLHttpRequest' http://127.0.0.1:5000/api/scan
+```
 
 ---
 
@@ -504,5 +545,22 @@ gunicorn -w 1 -b 127.0.0.1:5000 app:app
 - Use a **single worker** (`-w 1`) so the in-process scan manager and SQLite stay
   consistent.
 - The dashboard has **no built-in authentication**. Keep it bound to localhost,
-  or behind a VPN / reverse proxy with access control.
-- Never commit `api_keys.txt` or `dashboard.db` (both are gitignored).
+  or behind a VPN / reverse proxy with access control. `python app.py` refuses
+  to bind to anything but loopback unless `ALLOW_REMOTE_BIND=true`; when you do
+  put it behind a proxy, add the proxy's hostname to `TRUSTED_HOSTS`.
+- Browser-side protection is built in: state-changing requests need the
+  `X-Requested-With` header and a same-origin `Origin`, the `Host` header is
+  validated, and the page ships a strict Content-Security-Policy, `X-Frame-Options:
+  DENY` and friends.
+- Keep `api_keys.txt` and `dashboard.db` at mode `0600` (the database is created
+  that way; the key file is yours to lock down — the scan start toast warns if
+  it is readable by other users). Never commit either (both are gitignored),
+  and treat `audit.log` the same way: it names your targets.
+- Dependencies are pinned in `requirements.txt`; run `pip-audit -r
+  requirements.txt` before deploying.
+- Run the test suite after changes (no network, no API quota — WPScan is
+  replaced by a replay script):
+
+```bash
+python -m unittest discover -s tests -t .
+```

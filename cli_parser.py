@@ -35,7 +35,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from parser import classify_severity
+from parser import EXPLOIT_REF_KINDS, classify_severity, reference_url
 
 # Section headers that change how following component blocks are interpreted.
 _SECTION_RE = re.compile(r"^\[i\]\s+(.*?)\s+Identified", re.IGNORECASE)
@@ -53,6 +53,20 @@ _TITLE_RE = re.compile(r"\[!\]\s*Title:\s*(.+?)\s*$")
 _FIXED_RE = re.compile(r"Fixed in:\s*([0-9][^\s]*)")
 _CVE_RE = re.compile(r"-\s*cve:\s*([0-9A-Za-z\-]+)", re.I)
 _URL_REF_RE = re.compile(r"-\s*url:\s*(\S+)", re.I)
+_OTHER_REF_RE = re.compile(r"-\s*(wpvulndb|exploitdb|metasploit|packetstorm):\s*(\S+)", re.I)
+# "[+] WordPress theme in use: astra" — the main theme block follows the core
+# block with no section header, so it needs its own trigger or its vulns get
+# attributed to WordPress core.
+_MAIN_THEME_RE = re.compile(r"^\[\+\]\s+WordPress theme in use:\s*(\S+)", re.I)
+# Config backups / DB exports are listed as bare URL lines with a [!] icon
+# ("[!] https://site/wp-config.php.bak"), never as "Title:" blocks.
+_EXPOSED_URL_RE = re.compile(r"^\[!\]\s+(https?://\S+)")
+# Same component_name / title shape as parser.py's JSON path, so a site scanned
+# in both formats de-duplicates to one row.
+_EXPOSURE_SECTIONS = {
+    "config_backup": ("config_backups", "high"),
+    "db_export":     ("db_exports", "critical"),
+}
 
 # Map a section label to the component_type stored on findings.
 _SECTION_TYPE = {
@@ -91,14 +105,15 @@ def _clean(line: str) -> str:
 def _finding(site: str, title: str, ctype: str, cname: str,
              version: str | None, fixed_in: str | None,
              cves: list[str], refs: list[str],
-             severity: str | None = None) -> dict[str, Any]:
+             severity: str | None = None,
+             kind: str = "vulnerability") -> dict[str, Any]:
     sev, cvss = classify_severity(title)
     if severity is not None:
         sev = severity
     severity = sev
     return {
         "site": site.rstrip("/"),
-        "finding_kind": "vulnerability",
+        "finding_kind": kind,
         "component_type": ctype,
         "component_name": cname,
         "component_version": version,
@@ -109,6 +124,22 @@ def _finding(site: str, title: str, ctype: str, cname: str,
         "cves": cves,
         "references": refs,
     }
+
+
+def _section_from_label(label: str) -> str | None:
+    """Map an 'Enumerating ...' / '... Identified' label to a section type."""
+    label = label.lower()
+    if "plugin" in label:
+        return "plugin"
+    if "theme" in label:
+        return "theme"
+    if "user" in label:
+        return "user"
+    if "config backup" in label:
+        return "config_backup"
+    if "db export" in label:
+        return "db_export"
+    return None
 
 
 class StreamingParser:
@@ -154,7 +185,8 @@ class StreamingParser:
                     self._emit(_finding(
                         self.site, v["title"], ctype, self._cur_name,
                         self._cur_version, v.get("fixed_in"),
-                        v.get("cves", []), v.get("refs", [])))
+                        v.get("cves", []),
+                        v.get("refs", []) + v.get("exploits", [])))
             elif self._cur_outdated:
                 self._emit(_finding(
                     self.site,
@@ -199,19 +231,19 @@ class StreamingParser:
             self._section_type = "interesting"
             return
 
+        # Main theme block (follows the core block without a section header)
+        mt = _MAIN_THEME_RE.match(raw)
+        if mt:
+            self._flush()
+            self._section_type = "theme"
+            self._cur_name = mt.group(1).strip()
+            return
+
         # "[+] Enumerating ..." starts a section (WPScan 4.x layout)
         em = _ENUM_RE.match(raw)
         if em:
             self._flush()
-            label = em.group(1).lower()
-            if "plugin" in label:
-                self._section_type = "plugin"
-            elif "theme" in label:
-                self._section_type = "theme"
-            elif "user" in label:
-                self._section_type = "user"
-            else:
-                self._section_type = None
+            self._section_type = _section_from_label(em.group(1))
             return
 
         # "[i] 2 plugin(s) Identified." / "[i] No themes Found." end a section
@@ -220,20 +252,25 @@ class StreamingParser:
             self._section_type = None
             return
 
-        # Section headers ("[i] Plugin(s) Identified:" — older layout)
+        # Section headers ("[i] Plugin(s) Identified:" — older layout, and
+        # "[i] Config Backup(s) Identified:" in every layout)
         sm = _SECTION_RE.search(raw)
         if sm:
             self._flush()
-            label = sm.group(1).strip().lower()
-            if "plugin" in label:
-                self._section_type = "plugin"
-            elif "theme" in label:
-                self._section_type = "theme"
-            elif "user" in label:
-                self._section_type = "user"
-            else:
-                self._section_type = None
+            self._section_type = _section_from_label(sm.group(1))
             return
+
+        # Exposed config backup / DB export URL lines
+        if self._section_type in _EXPOSURE_SECTIONS:
+            xm = _EXPOSED_URL_RE.match(raw)
+            if xm:
+                url = xm.group(1)
+                bucket, sev = _EXPOSURE_SECTIONS[self._section_type]
+                self._emit(_finding(
+                    self.site, f"Exposed {bucket.replace('_', ' ')}: {url}",
+                    "config", bucket, None, None, [], [url],
+                    severity=sev, kind="exposure"))
+                return
 
         # End-of-section sentinels
         if (raw.startswith("[+] Finished") or raw.startswith("[+] Started")
@@ -305,6 +342,15 @@ class StreamingParser:
             um = _URL_REF_RE.search(body)
             if um:
                 self._cur_vuln["refs"].append(um.group(1))
+            om = _OTHER_REF_RE.search(body)
+            if om:
+                u = reference_url(om.group(1), om.group(2))
+                if u:
+                    # Exploit links go last so the first URL stays the advisory.
+                    target = (self._cur_vuln.setdefault("exploits", [])
+                              if om.group(1).lower() in EXPLOIT_REF_KINDS
+                              else self._cur_vuln["refs"])
+                    target.append(u)
 
     def finish(self) -> None:
         """Flush any component still in progress (call when output ends)."""

@@ -11,3 +11,6 @@ api_keys.txt
 
 # Local assistant notes (kept out of the public repo)
 CLAUDE.md
+
+# Operator action log (may name real targets)
+audit.log

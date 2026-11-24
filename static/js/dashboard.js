@@ -31,6 +31,21 @@ const el = (tag, cls, txt) => {
 };
 const host = (url) => { try { return new URL(url).host; } catch { return url; } };
 
+/* Every state-changing call carries this header. The server refuses POSTs
+ * without it, which is what stops a hostile web page from driving the API
+ * through the operator's browser (a cross-site form can't set custom headers
+ * and the CORS preflight for one is never answered). */
+const POST_HEADERS = { "X-Requested-With": "XMLHttpRequest" };
+function apiPost(url, body) {
+  const opts = { method: "POST", headers: { ...POST_HEADERS } };
+  if (body !== undefined) {
+    opts.headers["Content-Type"] = "application/json";
+    opts.body = JSON.stringify(body);
+  }
+  return fetch(url, opts);
+}
+const EXPLOIT_URL_RE = /exploit-db\.com\/exploits\/|rapid7\.com\/db\/modules\/|packetstormsecurity\.com\/files\//;
+
 /* ------------------------------- Data ------------------------------- */
 async function load() {
   const res = await fetch(`/api/findings?since=${state.lastEventId}`);
@@ -205,8 +220,12 @@ function renderPosture(summary) {
     seg.title = `${n} ${s}`;
     bar.appendChild(seg);
   });
-  if (!total) bar.appendChild(Object.assign(el("div", "seg info"),
-    { style: "flex-grow:1;opacity:.25" }));
+  if (!total) {
+    const seg = el("div", "seg info");   // CSSOM, not an inline style attr (CSP)
+    seg.style.flexGrow = "1";
+    seg.style.opacity = ".25";
+    bar.appendChild(seg);
+  }
 
   const legend = $("#severity-legend");
   legend.innerHTML = "";
@@ -341,11 +360,7 @@ async function retryTarget(site) {
   }
   showToast(`Retrying ${host(site)}…`, "info");
   try {
-    const res = await fetch("/api/scan", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ site }),
-    });
+    const res = await apiPost("/api/scan", { site });
     const data = await res.json();
     if (!res.ok) { showToast(data.error || "Retry failed.", "error"); return; }
     await load();   // picks up the running state and starts fast polling
@@ -397,35 +412,29 @@ function renderScanState(scanning, progress) {
 
 /* ------------- Batch-level pause / resume / cancel ------------------- */
 async function pauseBatch() {
-  await fetch("/api/pause", { method: "POST" });
+  await apiPost("/api/pause");
   showToast("Batch will pause after the current site finishes.", "info");
   await load();
 }
 async function resumeBatch() {
-  await fetch("/api/resume", { method: "POST" });
+  await apiPost("/api/resume");
   showToast("Batch resumed.", "info");
   await load();
 }
 async function cancelBatch() {
   if (!confirm("Cancel the scan batch? Sites not yet scanned will be skipped.")) return;
-  await fetch("/api/cancel", { method: "POST" });
+  await apiPost("/api/cancel");
   showToast("Batch cancelled.", "warn");
   await load();
 }
 /* ------------- Per-site pause / resume ------------------------------- */
 async function pauseSite(site) {
-  await fetch("/api/pause-site", {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ site }),
-  });
+  await apiPost("/api/pause-site", { site });
   showToast(`Scan will hold before ${host(site)}.`, "info");
   await load();
 }
 async function resumeSite(site) {
-  await fetch("/api/resume-site", {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ site }),
-  });
+  await apiPost("/api/resume-site", { site });
   showToast(`Releasing hold on ${host(site)}.`, "info");
   await load();
 }
@@ -529,10 +538,19 @@ function rowFor(f) {
     a.target = "_blank"; a.rel = "noopener noreferrer";
     box.appendChild(a);
   });
-  const firstUrl = (f.references || []).find((r) => /^https?:\/\//.test(r || ""));
+  const refs = (f.references || []).filter((r) => /^https?:\/\//.test(r || ""));
+  const firstUrl = refs.find((r) => !EXPLOIT_URL_RE.test(r)) || refs[0];
   if (firstUrl) {
     const a = el("a", "reflink", "advisory ↗");
     a.href = firstUrl; a.target = "_blank"; a.rel = "noopener noreferrer";
+    box.appendChild(a);
+  }
+  // A public exploit changes triage order more than the severity label does.
+  const exploitUrl = refs.find((r) => EXPLOIT_URL_RE.test(r));
+  if (exploitUrl) {
+    const a = el("a", "exploit", "exploit available ↗");
+    a.href = exploitUrl; a.target = "_blank"; a.rel = "noopener noreferrer";
+    a.title = "A public exploit or Metasploit module exists for this issue";
     box.appendChild(a);
   }
   if (!box.children.length) box.appendChild(el("span", "no-ref", "—"));
@@ -545,7 +563,7 @@ function rowFor(f) {
 /* ------------------------------ Actions ----------------------------- */
 async function post(url, okMsg) {
   try {
-    const res = await fetch(url, { method: "POST" });
+    const res = await apiPost(url);
     const data = await res.json();
     if (!res.ok) { alert(data.error || "Request failed."); return; }
     await load();
@@ -610,14 +628,17 @@ $("#settings-save").addEventListener("click", async () => {
     WPSCAN_ENUMERATE:      $("#s-enumerate").value.trim(),
   };
   try {
-    const r = await fetch("/api/settings", {
-      method: "POST", headers: {"Content-Type": "application/json"},
-      body: JSON.stringify(body),
-    });
+    const r = await apiPost("/api/settings", body);
     const d = await r.json();
     if (d.saved) {
       $("#settings-status").textContent = "✓ Saved";
       setTimeout(() => { $("#settings-status").textContent = ""; }, 2500);
+    } else if (d.invalid) {
+      // Server validates ranges/choices; show which field it refused.
+      const why = Object.entries(d.invalid).map(([k, v]) => `${k}: ${v}`).join("; ");
+      $("#settings-status").textContent = "Rejected — " + why;
+    } else {
+      $("#settings-status").textContent = d.error || "Save failed";
     }
   } catch { $("#settings-status").textContent = "Save failed"; }
 });

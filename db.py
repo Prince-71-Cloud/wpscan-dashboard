@@ -15,6 +15,7 @@ stale duplicates.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -76,8 +77,16 @@ class Database:
             conn.close()
 
     def init_schema(self) -> None:
+        created = not os.path.exists(self.path)
         with self._conn() as c:
             c.executescript(_SCHEMA)
+        if created:
+            # The file holds unpatched-vulnerability details about real client
+            # sites; keep it from other local accounts.
+            try:
+                os.chmod(self.path, 0o600)
+            except OSError:
+                pass
 
     # -- scans ------------------------------------------------------------- #
     def create_scan(self, site: str, status: str = "pending", source: str = "wpscan") -> int:

@@ -21,6 +21,12 @@ without code changes.
   SCAN_TIMEOUT       per-site scan timeout in seconds          (default: 1800)
   SAMPLE_DIR         directory of sample WPScan JSON reports    (default: sample_scans)
   HOST / PORT        bind address                              (default: 127.0.0.1:5000)
+  ALLOW_REMOTE_BIND  allow HOST other than loopback (no auth!)  (default: false)
+  TRUSTED_HOSTS      extra Host header values to accept, comma  (default: loopback names
+                     separated (DNS-rebinding guard)             + HOST)
+  AUDIT_LOG          file that records who started/stopped what (default: audit.log)
+  WPSCAN_THROTTLE    ms to wait between WPScan requests          (default: 0)
+  WPSCAN_MAX_THREADS WPScan --max-threads (gentler on targets)   (default: wpscan default)
 """
 
 import os
@@ -52,4 +58,9 @@ CONFIG = {
     "SAMPLE_DIR":       os.environ.get("SAMPLE_DIR", "sample_scans"),
     "HOST":             os.environ.get("HOST", "127.0.0.1"),
     "PORT":             _int("PORT", 5000),
+    "ALLOW_REMOTE_BIND": os.environ.get("ALLOW_REMOTE_BIND", "false"),
+    "TRUSTED_HOSTS":    os.environ.get("TRUSTED_HOSTS", ""),
+    "AUDIT_LOG":        os.environ.get("AUDIT_LOG", "audit.log"),
+    "WPSCAN_THROTTLE":  _int("WPSCAN_THROTTLE", 0),
+    "WPSCAN_MAX_THREADS": _int("WPSCAN_MAX_THREADS", 0),
 }

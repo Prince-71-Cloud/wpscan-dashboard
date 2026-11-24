@@ -1,0 +1,74 @@
+[+] URL: https://example.test/ [203.0.113.5]
+[+] Started: Mon Nov 24 10:00:00 2025
+
+Interesting Finding(s):
+
+[+] Headers
+ | Interesting Entries:
+ |  - server: nginx
+ | Found By: Headers (Passive Detection)
+
+[+] XML-RPC seems to be enabled: https://example.test/xmlrpc.php
+ | Found By: Direct Access (Aggressive Detection)
+
+[+] WordPress version 6.1 identified (Insecure, released on 2022-11-01).
+ | Found By: Rss Generator (Passive Detection)
+
+[+] WordPress theme in use: astra
+ | Location: https://example.test/wp-content/themes/astra/
+ | Last Updated: 2024-01-01T00:00:00.000Z
+ | [!] The version is out of date, the latest version is 4.6.0
+ | Version: 4.1.0 (80% confidence)
+ |
+ | [!] 1 vulnerability identified:
+ |
+ | [!] Title: Astra < 4.1.6 - Reflected Cross-Site Scripting
+ |     Fixed in: 4.1.6
+ |     References:
+ |      - cve: 2023-1234
+ |      - url: https://wpscan.com/vulnerability/abc
+
+[+] Enumerating Vulnerable Plugins (via Passive and Aggressive Methods)
+ Checking Known Locations - Time: 00:00:10 <===> (100 / 100) 100.00% Time: 00:00:10
+[i] Plugin(s) Identified:
+
+[+] contact-form-7
+ | Location: https://example.test/wp-content/plugins/contact-form-7/
+ | Version: 5.3.1 (100% confidence)
+ |
+ | [!] Title: Contact Form 7 < 5.3.2 - Unrestricted File Upload
+ |     Fixed in: 5.3.2
+ |     References:
+ |      - cve: 2020-35489
+ |      - url: https://wpscan.com/vulnerability/def
+ |      - exploitdb: 49000
+ |      - metasploit: exploit/multi/http/wp_cf7_upload
+
+[+] Enumerating Config Backups (via Passive and Aggressive Methods)
+ Checking Config Backups - Time: 00:00:01 <===> (137 / 137) 100.00% Time: 00:00:01
+
+[i] Config Backup(s) Identified:
+
+[!] https://example.test/wp-config.php.bak
+ | Found By: Direct Access (Aggressive Detection)
+
+[+] Enumerating DB Exports (via Passive and Aggressive Methods)
+ Checking DB Exports - Time: 00:00:00 <===> (71 / 71) 100.00% Time: 00:00:00
+
+[i] Db Export(s) Identified:
+
+[!] https://example.test/backup.sql
+ | Found By: Direct Access (Aggressive Detection)
+
+[+] Enumerating Users (via Passive and Aggressive Methods)
+[i] User(s) Identified:
+
+[+] admin
+ | Found By: Author Posts - Author Pattern (Passive Detection)
+
+[+] WPScan DB API OK
+ | Plan: free
+ | Requests Done (during the scan): 3
+ | Requests Remaining: 20
+
+[+] Finished: Mon Nov 24 10:01:00 2025

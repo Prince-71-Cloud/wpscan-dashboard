@@ -21,6 +21,7 @@ from __future__ import annotations
 import datetime as _dt
 import io
 from typing import Any
+from xml.sax.saxutils import escape as _xml_escape
 
 from parser import SEVERITY_ORDER, SEVERITY_RANK, summarize
 
@@ -106,6 +107,17 @@ def build_report(db, config: dict[str, Any] | None = None) -> dict[str, Any]:
     }
 
 
+def _esc(value: Any) -> str:
+    """Escape target-controlled text for reportlab's Paragraph mini-markup.
+
+    Finding titles, component names, site URLs and scan error strings all
+    originate from the scanned host (or from WPScan echoing it). Paragraph
+    parses XML-like tags, so an unescaped '<font>' would restyle the report
+    and an unbalanced tag crashes the renderer. Everything that is not our
+    own literal markup goes through here."""
+    return _xml_escape("" if value is None else str(value))
+
+
 def _fmt_ts(ts: Any) -> str:
     if not ts:
         return "—"
@@ -169,7 +181,7 @@ def build_pdf(report: dict[str, Any]) -> bytes:
     story.append(Paragraph("WordPress Security Audit", h1))
     n_partial = scope.get("targets_partial", 0)
     story.append(Paragraph(
-        f"Generated {report.get('generated_at', '')} &nbsp;·&nbsp; "
+        f"Generated {_esc(report.get('generated_at', ''))} &nbsp;·&nbsp; "
         f"{scope.get('targets_scanned', 0)} of {scope.get('targets_total', 0)} "
         f"target(s) assessed"
         + (f" ({n_partial} more partially)" if n_partial else "")
@@ -209,9 +221,9 @@ def build_pdf(report: dict[str, Any]) -> bytes:
         status_txt = (status or "not scanned").replace("_", " ")
         color = {"success": "#1a7f4b", "partial": "#b58900"}.get(status, "#c0182b")
         rows.append([
-            Paragraph(tgt.get("site", ""), cell),
-            Paragraph(f"<font color='{color}'>{status_txt}</font>", cell),
-            Paragraph(tgt.get("wp_version") or "—", cell),
+            Paragraph(_esc(tgt.get("site", "")), cell),
+            Paragraph(f"<font color='{color}'>{_esc(status_txt)}</font>", cell),
+            Paragraph(_esc(tgt.get("wp_version") or "—"), cell),
             Paragraph(_fmt_ts(tgt.get("finished_at")), cell),
             Paragraph(str(tgt.get("findings", 0)), cell),
         ])
@@ -240,7 +252,8 @@ def build_pdf(report: dict[str, Any]) -> bytes:
             "findings are real but coverage is incomplete.", note))
         for t_ in partial:
             story.append(Paragraph(
-                f"• {t_.get('site')} — {(t_.get('error') or 'scan timed out')[:220]}",
+                f"• {_esc(t_.get('site'))} — "
+                f"{_esc((t_.get('error') or 'scan timed out')[:220])}",
                 small))
     if failed:
         story.append(Spacer(1, 5))
@@ -249,7 +262,8 @@ def build_pdf(report: dict[str, Any]) -> bytes:
             "security posture is unknown, not clean.", note))
         for t_ in failed:
             story.append(Paragraph(
-                f"• {t_.get('site')} — {(t_.get('error') or 'scan failed')[:220]}",
+                f"• {_esc(t_.get('site'))} — "
+                f"{_esc((t_.get('error') or 'scan failed')[:220])}",
                 small))
 
     # ---- Findings -------------------------------------------------------- #
@@ -263,26 +277,27 @@ def build_pdf(report: dict[str, Any]) -> bytes:
                   "Fixed in", "Reference")]]
         for f in findings:
             sev = f.get("severity", "info")
-            cves = ", ".join(f.get("cves") or [])
+            cves = ", ".join(str(c) for c in (f.get("cves") or []))
             refs = f.get("references") or []
-            ref_txt = cves or (refs[0] if refs else "—")
+            ref_txt = _esc(cves or (refs[0] if refs else "—"))
             cvss = f.get("cvss")
-            title = f.get("title", "")
+            title = _esc(f.get("title", ""))
             if cvss:
-                title += f" <font color='#5c6879'>(CVSS {cvss})</font>"
-            comp = f.get("component_name") or "—"
+                title += f" <font color='#5c6879'>(CVSS {_esc(cvss)})</font>"
+            comp = _esc(f.get("component_name") or "—")
             ctype = (f.get("component_type") or "").strip()
             if ctype:
-                comp = f"{comp}<br/><font color='#5c6879' size='6.5'>{ctype}</font>"
+                comp = (f"{comp}<br/><font color='#5c6879' size='6.5'>"
+                        f"{_esc(ctype)}</font>")
             rows.append([
                 Paragraph(f"<b><font size='6.8' color='"
                           f"{_PDF_SEV_COLORS.get(sev, '#5c6879')}'>"
                           f"{sev.upper()}</font></b>", cell),
                 Paragraph(title, cell),
-                Paragraph(f.get("site", ""), cell),
+                Paragraph(_esc(f.get("site", "")), cell),
                 Paragraph(comp, cell),
-                Paragraph(f.get("component_version") or "—", cell),
-                Paragraph(f.get("fixed_in") or "no fix", cell),
+                Paragraph(_esc(f.get("component_version") or "—"), cell),
+                Paragraph(_esc(f.get("fixed_in") or "no fix"), cell),
                 Paragraph(ref_txt, small),
             ])
         t = Table(rows, repeatRows=1,
@@ -309,7 +324,7 @@ def build_pdf(report: dict[str, Any]) -> bytes:
     # ---- Method notes ---------------------------------------------------- #
     story.append(Paragraph("Method and caveats", h2))
     for n in report.get("notes", []):
-        story.append(Paragraph(f"• {n}", note))
+        story.append(Paragraph(f"• {_esc(n)}", note))
     story.append(Spacer(1, 4))
     story.append(Paragraph(
         "Scanning was performed with WPScan against targets supplied by the "

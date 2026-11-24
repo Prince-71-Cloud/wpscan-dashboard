@@ -1,0 +1,29 @@
+[+] URL: https://example.test/ [203.0.113.5]
+[+] Started: Mon Nov 24 10:00:00 2025
+
+[+] WordPress version 6.1 identified (Insecure, released on 2022-11-01).
+ | Found By: Rss Generator (Passive Detection)
+
+[+] Enumerating Vulnerable Plugins (via Passive and Aggressive Methods)
+ Checking Known Locations - Time: 00:00:10 <===> (100 / 100) 100.00% Time: 00:00:10
+
+[+] contact-form-7
+ | Location: https://example.test/wp-content/plugins/contact-form-7/
+ | Version: 5.3.1 (100% confidence)
+ |
+ | [!] Title: Contact Form 7 < 5.3.2 - Unrestricted File Upload
+ |     Fixed in: 5.3.2
+ |     References:
+ |      - cve: 2020-35489
+
+[i] 1 plugin(s) Identified.
+
+[+] Enumerating Config Backups (via Passive and Aggressive Methods)
+[i] No Config Backups Found.
+
+[+] WPScan DB API OK
+ | Plan: free
+ | Requests Done (during the scan): 2
+ | Requests Remaining: 0
+
+[+] Finished: Mon Nov 24 10:01:00 2025

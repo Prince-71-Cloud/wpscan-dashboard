@@ -50,7 +50,13 @@ _KEYWORD_SEVERITY: list[tuple[str, str]] = [
     # Most dangerous first; first match wins.
     ("critical", r"remote code execution|\brce\b|arbitrary file upload|"
                  r"unauthenticated arbitrary|object injection|deserializ|"
-                 r"arbitrary file (download|read|deletion) \(unauth"),
+                 r"arbitrary file (download|read|deletion) \(unauth|"
+                 # Pre-auth variants of what would otherwise be "high": these
+                 # are the 9.8s in practice.
+                 r"unauthenticated.*(sql injection|\bsqli\b|privilege "
+                 r"escalation|account takeover|arbitrary file|password reset)|"
+                 r"arbitrary (plugin|theme) installation|"
+                 r"arbitrary (options?|settings?) update"),
     ("high",     r"sql injection|\bsqli\b|authentication bypass|auth bypass|"
                  r"privilege escalation|account takeover|arbitrary file|"
                  r"file inclusion|\blfi\b|\brfi\b|command injection|"
@@ -62,6 +68,14 @@ _KEYWORD_SEVERITY: list[tuple[str, str]] = [
     ("low",      r"denial of service|\bdos\b|clickjacking|enumeration|"
                  r"full path disclosure|version disclosure"),
 ]
+
+
+# A vulnerability that needs an Administrator (or Super Admin) account to
+# trigger is rarely worth more than "medium": that role can already install
+# arbitrary plugins. WPScan titles carry the role, e.g. "Admin+ Stored XSS" or
+# "Authenticated (Admin+) SQL Injection".
+_ADMIN_ONLY_RE = re.compile(r"\b(administrator|admin|super ?admin)\+")
+_ADMIN_CAP = "medium"
 
 
 def _cvss_to_severity(score: float) -> str:
@@ -107,30 +121,78 @@ def classify_severity(title: str, vuln: dict[str, Any] | None = None) -> tuple[s
         return _cvss_to_severity(cvss), cvss
 
     lowered = (title or "").lower()
-    for severity, pattern in _KEYWORD_SEVERITY:
+    severity = "medium"
+    for sev, pattern in _KEYWORD_SEVERITY:
         if re.search(pattern, lowered):
-            return severity, None
-    return "medium", None
+            severity = sev
+            break
+    if (_ADMIN_ONLY_RE.search(lowered)
+            and SEVERITY_RANK[severity] < SEVERITY_RANK[_ADMIN_CAP]):
+        severity = _ADMIN_CAP
+    return severity, None
 
 
 # --------------------------------------------------------------------------- #
 # Reference / CVE extraction
 # --------------------------------------------------------------------------- #
+# Public exploit references WPScan ships alongside advisories. Keeping them
+# (as URLs, in the existing `references` list) lets the UI flag "exploit
+# available", which changes triage order far more than a CVSS decimal does.
+EXPLOIT_REF_KINDS = ("exploitdb", "metasploit", "packetstorm")
+_EXPLOIT_URL_RE = re.compile(
+    r"exploit-db\.com/exploits/|rapid7\.com/db/modules/|packetstormsecurity\.com/files/")
+
+
+def reference_url(kind: str, value: Any) -> str | None:
+    """Turn a WPScan reference (kind, value) into a URL, or None if unknown."""
+    kind = (kind or "").lower()
+    val = str(value).strip()
+    if kind == "url":
+        return val or None
+    val = val.strip("/")
+    if not val:
+        return None
+    if kind == "wpvulndb":
+        return f"https://wpscan.com/vulnerability/{val}"
+    if kind == "exploitdb":
+        return f"https://www.exploit-db.com/exploits/{val}"
+    if kind == "metasploit":
+        return f"https://www.rapid7.com/db/modules/{val}/"
+    if kind == "packetstorm":
+        return f"https://packetstormsecurity.com/files/{val}/"
+    if kind == "youtube":
+        return f"https://www.youtube.com/watch?v={val}"
+    return None
+
+
+def has_exploit(references: list[str] | None) -> bool:
+    return any(_EXPLOIT_URL_RE.search(str(r)) for r in (references or []))
+
+
 def _split_refs(vuln: dict[str, Any]) -> tuple[list[str], list[str]]:
-    """Return (cves, reference_urls) for a vulnerability entry."""
+    """Return (cves, reference_urls) for a vulnerability entry. Advisory URLs
+    come first, public exploit URLs last, so the first URL is still the
+    advisory."""
     refs = vuln.get("references") or {}
     cves: list[str] = []
     urls: list[str] = []
+    exploits: list[str] = []
 
     if isinstance(refs, dict):
         for cve in refs.get("cve", []) or []:
             cve = str(cve).strip()
             cves.append(cve if cve.upper().startswith("CVE-") else f"CVE-{cve}")
-        for url in refs.get("url", []) or []:
-            urls.append(str(url))
-        for wpvdb in refs.get("wpvulndb", []) or []:
-            urls.append(f"https://wpscan.com/vulnerability/{wpvdb}")
-    return cves, urls
+        for kind in ("url", "wpvulndb"):
+            for val in refs.get(kind, []) or []:
+                u = reference_url(kind, val)
+                if u:
+                    urls.append(u)
+        for kind in EXPLOIT_REF_KINDS:
+            for val in refs.get(kind, []) or []:
+                u = reference_url(kind, val)
+                if u:
+                    exploits.append(u)
+    return cves, urls + exploits
 
 
 # --------------------------------------------------------------------------- #

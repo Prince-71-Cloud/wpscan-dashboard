@@ -61,6 +61,15 @@ _INVALID_KEY_MARKERS = (
 )
 
 
+# WPScan refuses to scan a URL that redirects elsewhere (www., https, a new
+# domain) unless told to follow; we re-run once against the effective URL.
+_MAIN_REDIRECT_RE = re.compile(r"redirects to (\S+?)\.?(?:\s|$)")
+# cURL's wording when the certificate cannot be verified; the target is up,
+# WPScan just refuses the handshake. We retry once with checks disabled (the
+# passive checks already report the certificate problem as a finding).
+_TLS_FAILURE_RE = re.compile(r"ssl|tls|certificate", re.I)
+
+
 class WPScanError(Exception):
     pass
 
@@ -264,6 +273,14 @@ def read_api_keys(path: str) -> list[str]:
     return keys
 
 
+def key_file_is_shared(path: str) -> bool:
+    """True if the key file is readable by group/others (should be 0600)."""
+    try:
+        return bool(os.stat(path).st_mode & 0o077)
+    except OSError:
+        return False
+
+
 def preflight_check(url: str, timeout: int = 10) -> tuple[bool, str]:
     """Quick check before spending an API key on WPScan.
 
@@ -297,54 +314,80 @@ def preflight_check(url: str, timeout: int = 10) -> tuple[bool, str]:
     except (socket.timeout, OSError) as exc:
         return False, f"Host unreachable ({host}:{port}): {exc}"
 
-    # 2. HTTP response — any response means the web server is alive.
+    # 2. HTTP response — any response means the web server is alive. The
+    #    homepage body doubles as the first WordPress fingerprint source.
     headers = {"User-Agent": _UA}
     status = None
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    home_body = b""
+    home_headers: dict[str, str] = {}
     try:
-        req = _req.Request(url, method="HEAD", headers=headers)
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
+        req = _req.Request(url, method="GET", headers=headers)
         with _req.urlopen(req, timeout=timeout, context=ctx) as resp:
             status = resp.status
+            home_body = resp.read(65536)
+            home_headers = {k.lower(): v for k, v in resp.headers.items()}
     except _err.HTTPError as e:
         status = e.code  # 4xx/5xx still means the server responded
+        try:
+            home_body = e.read(65536)
+            home_headers = {k.lower(): v for k, v in (e.headers or {}).items()}
+        except Exception:  # noqa: BLE001 — body is optional here
+            pass
     except (_err.URLError, ssl.SSLError, socket.timeout, OSError) as exc:
         return False, f"HTTP request failed: {exc}"
 
-    # A 301/302 to a completely different domain (e.g. parked) is worth noting
-    # but we still proceed — WPScan can follow redirects itself.
-
-    # 3. WordPress fingerprint — check two lightweight paths.
-    #    /wp-login.php almost always returns 200 on a live WP site.
-    #    /wp-json/ returns JSON on WP 4.4+.
-    wp_found = False
-    for path in ("/wp-login.php", "/wp-json/"):
-        try:
-            req2 = _req.Request(url.rstrip("/") + path, method="GET",
-                                headers=headers)
-            ctx2 = ssl.create_default_context()
-            ctx2.check_hostname = False
-            ctx2.verify_mode = ssl.CERT_NONE
-            with _req.urlopen(req2, timeout=timeout, context=ctx2) as resp2:
-                body = resp2.read(2048)
-                if (b"wp-" in body or b"WordPress" in body
-                        or b"rest_url" in body or resp2.status < 400):
-                    wp_found = True
-                    break
-        except _err.HTTPError as e:
-            if e.code in (200, 301, 302, 401, 403):
-                wp_found = True  # WP auth gate still means WP is there
+    # 3. WordPress fingerprint. A status code alone proves nothing: a WAF
+    #    answers 403 to everything and a SPA answers 200 to everything, and
+    #    both used to pass here and burn API quota. Require an actual
+    #    WordPress marker in a body or header.
+    wp_found = _wp_signal(home_body, home_headers)
+    if not wp_found:
+        for path in ("/wp-login.php", "/wp-json/"):
+            try:
+                req2 = _req.Request(url.rstrip("/") + path, method="GET",
+                                    headers=headers)
+                with _req.urlopen(req2, timeout=timeout, context=ctx) as resp2:
+                    body = resp2.read(16384)
+                    hdrs = {k.lower(): v for k, v in resp2.headers.items()}
+            except _err.HTTPError as e:
+                try:
+                    body = e.read(16384)
+                except Exception:  # noqa: BLE001
+                    body = b""
+                hdrs = {k.lower(): v for k, v in (e.headers or {}).items()}
+            except Exception:  # noqa: BLE001
+                continue
+            if _wp_signal(body, hdrs):
+                wp_found = True
                 break
-        except Exception:  # noqa: BLE001
-            pass
 
     if not wp_found:
         return False, (f"Site is reachable (HTTP {status}) but no WordPress "
-                       f"fingerprint found (/wp-login.php, /wp-json/). "
-                       f"May not be WordPress — skipping to save API quota.")
+                       f"fingerprint found (homepage, /wp-login.php, /wp-json/). "
+                       f"May not be WordPress, or a WAF is hiding it — skipping "
+                       f"to save API quota (disable the pre-flight check to "
+                       f"force a scan).")
 
     return True, f"OK (HTTP {status}, WordPress detected)"
+
+
+_WP_BODY_MARKERS = (b"wp-content/", b"wp-includes/", b"/wp-json/", b"wp-login.php",
+                    b'"namespaces"', b"user_login", b"wp-emoji", b"WordPress")
+
+
+def _wp_signal(body: bytes, headers: dict[str, str]) -> bool:
+    """True if a response carries a WordPress marker in body or headers."""
+    if any(m in body for m in _WP_BODY_MARKERS):
+        return True
+    link = headers.get("link", "")
+    if "wp-json" in link or "api.w.org" in link:
+        return True
+    if "x-pingback" in headers:
+        return True
+    return "wordpress" in headers.get("x-generator", "").lower()
 
 
 def _truthy(val: Any) -> bool:
@@ -548,6 +591,9 @@ def run_wpscan(
     on_finding: "Callable[[dict], None] | None" = None,
     verbose: bool = True,
     fmt: str = "cli-no-colour",
+    throttle_ms: int = 0,
+    max_threads: int = 0,
+    disable_tls_checks: bool = False,
 ) -> dict[str, Any]:
     """Run WPScan against one URL and return a structured report
     ({site, wp_version, target_ip, findings}).
@@ -585,6 +631,14 @@ def run_wpscan(
         cmd += ["--plugins-detection", plugins_detection]
     if api_token:
         cmd += ["--api-token", api_token]
+    # Load controls: production sites and their WAFs notice a 5-thread
+    # aggressive plugin scan. --throttle forces single-threaded pacing.
+    if throttle_ms and throttle_ms > 0:
+        cmd += ["--throttle", str(int(throttle_ms))]
+    elif max_threads and max_threads > 0:
+        cmd += ["--max-threads", str(int(max_threads))]
+    if disable_tls_checks:
+        cmd += ["--disable-tls-checks"]
     if extra_args:
         cmd += extra_args
 
@@ -1073,6 +1127,14 @@ class ScanManager:
                 f"{keys if keys else 'no'} API key(s) in rotation.",
                 level="info",
             )
+            key_path = self.config.get("API_KEYS_FILE", "api_keys.txt")
+            if keys and key_file_is_shared(key_path):
+                self.events.emit(
+                    "scan_start",
+                    f"{key_path} is readable by other users on this machine — "
+                    f"run: chmod 600 {key_path}",
+                    level="warn",
+                )
             # Sites run one at a time — sequential, predictable, cheap on API quota.
             scan_ids.update({s: self.db.create_scan(s, status="queued") for s in sites})
             for idx, site in enumerate(sites, 1):
@@ -1085,7 +1147,17 @@ class ScanManager:
                 self.db.update_scan(scan_ids[site], status="running")
                 with self._lock:
                     self._current_site = site
-                self._scan_one(site, scan_ids[site], idx, len(sites))
+                try:
+                    self._scan_one(site, scan_ids[site], idx, len(sites))
+                except Exception as exc:  # noqa: BLE001 — never strand a site in 'running'
+                    self.db.update_scan(scan_ids[site], status="error",
+                                        finished_at=time_module.time(),
+                                        error=f"Internal error: {exc}")
+                    self.log.append(site, f"!! FAILED (internal): {exc}")
+                    self.events.emit("target_done",
+                                     f"[{idx}/{len(sites)}] {site} failed: {exc}",
+                                     level="error")
+                    self._mark_done()
                 with self._lock:
                     self._current_site = None
                 # Honour batch-level pause between sites.
@@ -1156,10 +1228,15 @@ class ScanManager:
             level="info",
         )
         # At least one attempt; up to one attempt per key if keys keep failing.
-        attempts = max(1, keyring.count())
+        # Redirect/TLS retries do not count against the key budget.
+        max_key_attempts = max(1, keyring.count())
+        key_attempts = 0
         last_limit_err: Exception | None = None
+        target_url = site          # may become the effective URL after a redirect
+        redirect_followed = False
+        tls_relaxed = False
 
-        for _ in range(attempts):
+        while True:
             try:
                 # run_wpscan returns an already-parsed report (cli_parser for
                 # cli formats, parser.parse_report for json), so the findings
@@ -1181,7 +1258,7 @@ class ScanManager:
                     )
 
                 parsed = run_wpscan(
-                    site,
+                    target_url,
                     wpscan_path=self.config.get("WPSCAN_PATH", "wpscan"),
                     api_token=key,
                     timeout=int(self.config.get("SCAN_TIMEOUT", 600)),
@@ -1193,33 +1270,59 @@ class ScanManager:
                     on_finding=_live_finding,
                     verbose=_truthy(self.config.get("WPSCAN_VERBOSE", True)),
                     fmt=self.config.get("WPSCAN_FORMAT", "cli-no-colour"),
+                    throttle_ms=int(self.config.get("WPSCAN_THROTTLE", 0) or 0),
+                    max_threads=int(self.config.get("WPSCAN_MAX_THREADS", 0) or 0),
+                    disable_tls_checks=tls_relaxed,
                 )
                 wp_findings = parsed["findings"]
 
-                extra_findings = self._hygiene_findings(parsed["site"] or site)
+                # Findings are keyed by the operator's target (sites.txt entry),
+                # even when WPScan ran against the redirected effective URL.
+                effective = parsed.get("site") or target_url
+                extra_findings = self._hygiene_findings(effective)
                 all_findings = wp_findings + extra_findings
-                self.db.replace_findings(parsed["site"], scan_id, all_findings)
+                self.db.replace_findings(site, scan_id, all_findings)
+
+                # WPScan does not abort when the key's daily quota runs out
+                # mid-scan: the API client silently returns no data for every
+                # component checked after that point. The scan then *looks*
+                # successful. Zero requests remaining therefore means the
+                # vulnerability data is incomplete, which is 'partial', not
+                # 'success'.
+                remaining = parsed.get("requests_remaining")
+                quota_hit = bool(key) and remaining is not None and remaining <= 0
+                status = "partial" if quota_hit else "success"
+                note = None
+                if quota_hit:
+                    note = (f"API {keyring.label(key)} ran out of daily requests "
+                            f"during this scan; components checked after that "
+                            f"point have no vulnerability data. Re-scan with a "
+                            f"fresh key for full coverage.")
                 self.db.update_scan(
-                    scan_id, status="success", finished_at=time.time(),
+                    scan_id, status=status, finished_at=time.time(),
                     wp_version=parsed.get("wp_version"),
                     target_ip=parsed.get("target_ip"),
+                    error=note,
                 )
                 n = len(all_findings)
                 extra_note = (f" ({len(wp_findings)} WPScan + "
                               f"{len(extra_findings)} hygiene)"
                               if extra_findings else "")
+                redirect_note = (f" via {effective}" if effective.rstrip("/")
+                                 != site.rstrip("/") else "")
                 self.events.emit(
                     "target_done",
-                    f"[{index}/{total}] {site} done — {n} finding(s){extra_note}.",
-                    level="success",
+                    f"[{index}/{total}] {site}{redirect_note} "
+                    f"{'partial (API quota exhausted)' if quota_hit else 'done'}"
+                    f" — {n} finding(s){extra_note}.",
+                    level="warn" if quota_hit else "success",
                 )
+                if quota_hit:
+                    self.log.append(site, f"!! PARTIAL: {note}")
                 self._mark_done()
-                # Scan succeeded, but if that used up the key's quota, retire it
-                # now so the next site doesn't waste an attempt discovering it.
-                # (Only available from the JSON format; None for cli, which just
-                # relies on reactive rotation when a key next rate-limits.)
-                remaining = parsed.get("requests_remaining")
-                if key and remaining is not None and remaining <= 0:
+                # Retire a spent key now so the next site doesn't waste an
+                # attempt discovering it.
+                if quota_hit:
                     keyring.report_exhausted(key)
                     self.events.emit(
                         "key_rotated",
@@ -1231,8 +1334,9 @@ class ScanManager:
             except KeyProblem as exc:
                 # Key is spent or rejected — retire it and retry on the next one.
                 last_limit_err = exc
-                if not key:
-                    break  # no keys configured at all; nothing to rotate to
+                key_attempts += 1
+                if not key or key_attempts >= max_key_attempts:
+                    break  # nothing (left) to rotate to
                 spent = key
                 next_key = keyring.report_exhausted(key)
                 if next_key and next_key != key:
@@ -1253,10 +1357,9 @@ class ScanManager:
                 partial = exc.partial
                 # The host answered WPScan, so the bounded hygiene checks are
                 # still worth running to make the partial result more complete.
-                extra_findings = self._hygiene_findings(partial["site"] or site)
+                extra_findings = self._hygiene_findings(partial["site"] or target_url)
                 partial["findings"] = partial["findings"] + extra_findings
-                self.db.replace_findings(partial["site"] or site, scan_id,
-                                         partial["findings"])
+                self.db.replace_findings(site, scan_id, partial["findings"])
                 self.db.update_scan(
                     scan_id, status="partial", finished_at=time.time(),
                     wp_version=partial.get("wp_version"),
@@ -1273,8 +1376,33 @@ class ScanManager:
                 self._mark_done()
                 return
             except WPScanError as exc:
+                msg = str(exc)
+                # "The URL supplied redirects to https://www.x/ ..." — scan the
+                # effective URL once instead of failing the target.
+                rm = _MAIN_REDIRECT_RE.search(msg)
+                if rm and not redirect_followed:
+                    redirect_followed = True
+                    target_url = normalize_site(rm.group(1))
+                    self.log.append(site, f"[~] Target redirects — rescanning as {target_url}")
+                    self.events.emit("target_start",
+                                     f"[{index}/{total}] {site} redirects to "
+                                     f"{target_url}; scanning that instead.",
+                                     level="info")
+                    continue
+                # Certificate rejected by cURL: retry with TLS checks off. The
+                # passive checks still report the certificate problem itself.
+                if (_TLS_FAILURE_RE.search(msg) and not tls_relaxed
+                        and target_url.startswith("https://")):
+                    tls_relaxed = True
+                    self.log.append(site, "[~] TLS handshake rejected — retrying "
+                                          "with --disable-tls-checks")
+                    self.events.emit("target_start",
+                                     f"[{index}/{total}] {site}: certificate "
+                                     f"rejected; retrying with TLS checks disabled.",
+                                     level="warn")
+                    continue
                 self.db.update_scan(scan_id, status="error", finished_at=time.time(),
-                                    error=str(exc))
+                                    error=msg)
                 self.log.append(site, f"!! FAILED: {exc}")
                 self.events.emit("target_done",
                                  f"[{index}/{total}] {site} failed: {exc}",
