@@ -17,7 +17,13 @@ class _DB:
     def latest_scan_status(self):
         return {"https://evil.test": {"status": "error" if self.error else "success",
                                       "error": self.error, "wp_version": "<6>",
-                                      "started_at": 1, "finished_at": 2}}
+                                      "started_at": 1, "finished_at": 2,
+                                      "new_count": 1, "fixed_count": 0}}
+
+    def resolved_findings(self, site=None, since=None, limit=200):
+        return [{"title": "<b>old</b> </para>", "severity": "high", "site": site,
+                 "component_type": "plugin", "component_name": "x",
+                 "first_seen": 1, "resolved_at": 2}]
 
 
 class PdfEscaping(unittest.TestCase):

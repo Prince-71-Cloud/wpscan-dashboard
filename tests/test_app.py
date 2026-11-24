@@ -9,6 +9,7 @@ _TMP = tempfile.mkdtemp(prefix="wpscan-test-")
 _SITES = pathlib.Path(_TMP, "sites.txt")
 _SITES.write_text("https://blog.example.com\n")
 os.environ.update({
+    "ENRICHMENT": "false",   # never hit NVD from tests
     "DATABASE": os.path.join(_TMP, "scratch.db"),
     "SITES_FILE": str(_SITES),
     "API_KEYS_FILE": os.path.join(_TMP, "no-keys"),
@@ -71,6 +72,20 @@ class Guards(unittest.TestCase):
         self.assertEqual(r.status_code, 400)
         self.assertEqual(r.get_json()["rejected"], ["http://10.0.0.1"])
         self.assertEqual(self.c.post("/api/scan", json={"sites": "x"}, headers=XHR).status_code, 400)
+
+    def test_findings_carry_remediation_and_history(self):
+        self.c.post("/api/ingest-samples", headers=XHR)
+        data = self.c.get("/api/findings").get_json()
+        f = data["findings"][0]
+        self.assertIn("remediation", f)
+        self.assertTrue(f["remediation"]["action"])
+        self.assertIn(f["history_status"], ("new", "recurring", "regressed"))
+        self.assertIn("enrichment", data)
+        self.assertEqual(self.c.get("/api/history").status_code, 200)
+        self.assertEqual(self.c.post("/api/enrich", headers=XHR).status_code, 400)  # disabled in tests
+        exp = self.c.get("/api/export.json").get_json()
+        self.assertTrue(exp["action_plan"])
+        self.assertIn("new_findings", exp["targets"][0])
 
     def test_audit_log_written(self):
         self.c.post("/api/clear", headers=XHR)

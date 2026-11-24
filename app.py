@@ -42,6 +42,8 @@ from urllib.parse import urlparse
 
 from flask import Flask, jsonify, make_response, render_template, request
 
+import enrich
+import remediation
 import report
 import scanner
 from config import CONFIG
@@ -50,7 +52,11 @@ from parser import SEVERITY_ORDER, SEVERITY_RANK, summarize
 
 app = Flask(__name__)
 db = Database(CONFIG["DATABASE"])
-manager = scanner.ScanManager(db, CONFIG)
+# CVE enrichment (NVD / EPSS / KEV) runs on its own background thread and
+# reports progress through the same event log the scan toasts use.
+enricher = enrich.Enricher(db, CONFIG)
+manager = scanner.ScanManager(db, CONFIG, enricher=enricher)
+enricher.events = manager.events
 
 _LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1", "[::1]")
 
@@ -150,6 +156,7 @@ def api_findings():
     findings = db.all_findings()
     findings.sort(key=lambda f: (SEVERITY_RANK.get(f.get("severity"), 99),
                                  f.get("site") or ""))
+    remediation.attach(findings)   # derived, never stored
     statuses = db.latest_scan_status()
 
     # Configured targets that have never been scanned still deserve a row.
@@ -179,7 +186,28 @@ def api_findings():
         "events": manager.events.since(since),
         "last_event_id": manager.events.latest_id(),
         "wpscan_keys_configured": scanner.configured_key_count(CONFIG),
+        "enrichment": enricher.status(),
     })
+
+
+@app.route("/api/history")
+def api_history():
+    """Findings that disappeared from a later scan (fixed), newest first.
+    `?site=` narrows to one target."""
+    site = request.args.get("site") or None
+    if site:
+        site = scanner.normalize_site(site)
+    return jsonify({"resolved": db.resolved_findings(site, limit=200)})
+
+
+@app.route("/api/enrich", methods=["POST"])
+def api_enrich():
+    """Fetch CVSS/EPSS/KEV data for any CVEs not yet cached (background)."""
+    if not enricher.enabled():
+        return jsonify({"error": "Enrichment is disabled (ENRICHMENT=false)."}), 400
+    started = enricher.schedule()
+    audit("enrich", started=started)
+    return jsonify({"started": started, "status": enricher.status()})
 
 
 _MAX_BATCH = 1000
@@ -223,7 +251,7 @@ def api_scan():
 
 @app.route("/api/ingest-samples", methods=["POST"])
 def api_ingest_samples():
-    count = scanner.ingest_directory(db, CONFIG["SAMPLE_DIR"])
+    count = scanner.ingest_directory(db, CONFIG["SAMPLE_DIR"], enricher=enricher)
     audit("ingest_samples", directory=CONFIG["SAMPLE_DIR"], ingested=count)
     if count == 0:
         return jsonify({"error": f"No JSON reports found in {CONFIG['SAMPLE_DIR']}."}), 400

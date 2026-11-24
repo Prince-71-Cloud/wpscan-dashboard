@@ -392,6 +392,55 @@ engagement that needs a throttled password audit, run WPScan's own
 
 ---
 
+## 6b. From finding to fix
+
+Click any row in the findings table to open its detail panel:
+
+- **Why this severity** — the exact reason (CVSS score and its source, title
+  keyword, Admin+ cap, CISA KEV listing) plus the EPSS exploitation probability.
+- **How to fix** — one concrete action (*Update contact-form-7 to 5.3.2 or
+  later*, *Remove exposed backup files and rotate the secrets they contain*),
+  ordered steps, and copy-paste snippets for WP-CLI, wp-config.php, Nginx,
+  Apache and PHP mu-plugins. Guidance is derived from a rule set in
+  `remediation.py`, so improving a rule improves every existing report.
+- **Evidence** — how the finding was produced: the request and status code,
+  the header or body sample observed, or WPScan's *Found By* / version
+  confidence. A developer can reproduce each one with a single `curl`.
+- **History** — first seen, last seen and whether it is new, recurring or
+  regressed.
+
+The PDF and JSON exports end with a **remediation plan**: findings grouped by
+action, worst severity first, so "update these three plugins" and "add these
+headers" read as a to-do list instead of forty separate rows.
+
+### CVE enrichment (NVD, EPSS, KEV)
+
+WPScan's CLI output carries no CVSS at all. After every scan or ingest the
+console looks up each CVE id (in the background, on one thread, never
+touching the scanned sites):
+
+| Source | What it adds |
+|---|---|
+| NVD | CVSS v3.1/3.0/2 base score and vector; a finding without its own score is re-graded with the standard bands |
+| FIRST EPSS | probability of exploitation in the next 30 days, shown as a percentage |
+| CISA KEV | "known exploited" flag; a KEV finding is always **critical** |
+
+Results are cached per CVE for `ENRICH_TTL_DAYS`, so a re-scan is graded
+instantly from the cache. Without `NVD_API_KEY` the public rate limit is about
+5 requests per 30 seconds, so a first run over many CVEs takes a few minutes;
+the header shows *CVE data: n pending* until it finishes. Set
+`ENRICHMENT=false` to turn it off, or `POST /api/enrich` to trigger a refresh.
+
+### History and diffs
+
+Every finding is tracked per site across scans. A re-scan reports what
+changed — **new**, **recurring**, **regressed** (previously fixed, now back)
+and **fixed** — on the target card, in the batch-complete toast, as badges in
+the table, and in the report's coverage and *Resolved since the previous scan*
+sections. The **Fixed** button lists everything that has been resolved.
+
+---
+
 ## 7. How severity is decided
 
 WPScan's free feed rarely includes a CVSS score, so severity is layered:
@@ -470,6 +519,9 @@ All settings are environment variables (see `config.py`):
 | `ALLOW_REMOTE_BIND` | `false` | `python app.py` refuses a non-loopback `HOST` unless this is `true` (there is no login) |
 | `TRUSTED_HOSTS` | *(loopback + HOST)* | Extra `Host` header values to accept, comma separated; anything else gets HTTP 400 (DNS-rebinding guard) |
 | `AUDIT_LOG` | `audit.log` | Append-only log of scan / clear / settings / export actions with the caller's address |
+| `ENRICHMENT` | `true` | Look up CVSS / EPSS / KEV for every CVE (NVD, FIRST, CISA); never touches the targets |
+| `NVD_API_KEY` | *(none)* | Free key from nvd.nist.gov raises the NVD rate limit tenfold |
+| `ENRICH_TTL_DAYS` | `7` | Re-fetch cached CVE data after this many days |
 
 `SCAN_TIMEOUT`, `PREFLIGHT_*`, `EXTRA_CHECKS`, `WPSCAN_ENUMERATE`,
 `WPSCAN_PLUGINS_DETECTION`, `WPSCAN_FORMAT`, `WPSCAN_THROTTLE` and
@@ -491,6 +543,8 @@ request changes nothing.
 | POST | `/api/pause`, `/api/resume`, `/api/cancel` | Pause between sites, resume, or cancel the batch |
 | POST | `/api/pause-site`, `/api/resume-site` | Hold or release a queued site; body includes `site` |
 | GET | `/api/scan-log` | Incremental live console output (`?since=<id>`) |
+| GET | `/api/history` | Findings resolved by a later scan (`?site=` to narrow) |
+| POST | `/api/enrich` | Fetch CVSS / EPSS / KEV for uncached CVEs in the background |
 | GET | `/api/export.json` | Full audit report as JSON (download) |
 | GET | `/api/export.pdf` | Full audit report as PDF (download) |
 | POST | `/api/clear` | Wipe stored scans and findings |

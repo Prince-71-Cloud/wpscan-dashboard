@@ -114,22 +114,34 @@ def _extract_cvss(vuln: dict[str, Any]) -> float | None:
     return None
 
 
-def classify_severity(title: str, vuln: dict[str, Any] | None = None) -> tuple[str, float | None]:
-    """Return (severity, cvss_or_None) for a vulnerability."""
+def classify_severity_ex(title: str, vuln: dict[str, Any] | None = None
+                         ) -> tuple[str, float | None, str]:
+    """Return (severity, cvss_or_None, reason). The reason is shown to the
+    developer so the ranking is explainable ("why is this high?")."""
     cvss = _extract_cvss(vuln) if vuln else None
     if cvss is not None:
-        return _cvss_to_severity(cvss), cvss
+        return _cvss_to_severity(cvss), cvss, f"CVSS {cvss} (WPScan advisory)"
 
     lowered = (title or "").lower()
     severity = "medium"
+    reason = "no CVSS available; default for a known vulnerability"
     for sev, pattern in _KEYWORD_SEVERITY:
-        if re.search(pattern, lowered):
+        m = re.search(pattern, lowered)
+        if m:
             severity = sev
+            reason = f"no CVSS available; title keyword '{m.group(0)}'"
             break
     if (_ADMIN_ONLY_RE.search(lowered)
             and SEVERITY_RANK[severity] < SEVERITY_RANK[_ADMIN_CAP]):
         severity = _ADMIN_CAP
-    return severity, None
+        reason += f"; capped at {_ADMIN_CAP} (needs an Admin+ account)"
+    return severity, None, reason
+
+
+def classify_severity(title: str, vuln: dict[str, Any] | None = None) -> tuple[str, float | None]:
+    """Return (severity, cvss_or_None) for a vulnerability."""
+    sev, cvss, _ = classify_severity_ex(title, vuln)
+    return sev, cvss
 
 
 # --------------------------------------------------------------------------- #
@@ -196,6 +208,35 @@ def _split_refs(vuln: dict[str, Any]) -> tuple[list[str], list[str]]:
 
 
 # --------------------------------------------------------------------------- #
+# Evidence: how WPScan detected the component / version, so a developer can
+# check the claim ("Urls In Homepage (Passive Detection), 80% confidence").
+# --------------------------------------------------------------------------- #
+def component_evidence(comp: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(comp, dict):
+        return None
+    ev: dict[str, Any] = {}
+    if comp.get("location"):
+        ev["location"] = comp["location"]
+    if comp.get("found_by"):
+        ev["found_by"] = comp["found_by"]
+    if comp.get("confidence") is not None:
+        ev["confidence"] = f"{comp['confidence']}%"
+    version = comp.get("version") or {}
+    if isinstance(version, dict):
+        if version.get("found_by"):
+            ev["version_found_by"] = version["found_by"]
+        if version.get("confidence") is not None:
+            ev["version_confidence"] = f"{version['confidence']}%"
+        entries = version.get("interesting_entries") or []
+        if entries:
+            ev["version_entries"] = [str(e)[:200] for e in entries[:3]]
+    entries = comp.get("interesting_entries") or []
+    if entries:
+        ev["entries"] = [str(e)[:200] for e in entries[:3]]
+    return ev or None
+
+
+# --------------------------------------------------------------------------- #
 # Component vulnerability walker
 # --------------------------------------------------------------------------- #
 def _findings_from_vulns(
@@ -204,11 +245,12 @@ def _findings_from_vulns(
     component_name: str,
     component_version: str | None,
     vulns: list[dict[str, Any]],
+    evidence: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for vuln in vulns or []:
         title = vuln.get("title") or f"Unnamed {component_type} vulnerability"
-        severity, cvss = classify_severity(title, vuln)
+        severity, cvss, reason = classify_severity_ex(title, vuln)
         cves, urls = _split_refs(vuln)
         out.append({
             "site": site,
@@ -222,6 +264,8 @@ def _findings_from_vulns(
             "fixed_in": vuln.get("fixed_in"),
             "cves": cves,
             "references": urls,
+            "evidence": evidence,
+            "severity_reason": reason,
         })
     return out
 
@@ -258,6 +302,11 @@ def _findings_from_interesting(site: str, entries: list[dict[str, Any]]) -> list
             for group in refs.values():
                 if isinstance(group, list):
                     urls.extend(str(u) for u in group)
+        evidence = {k: v for k, v in {
+            "url": entry.get("url"),
+            "found_by": entry.get("found_by"),
+            "entries": [str(e)[:200] for e in (entry.get("interesting_entries") or [])[:5]] or None,
+        }.items() if v}
 
         out.append({
             "site": site,
@@ -271,6 +320,8 @@ def _findings_from_interesting(site: str, entries: list[dict[str, Any]]) -> list
             "fixed_in": None,
             "cves": [],
             "references": [entry.get("url")] + urls if entry.get("url") else urls,
+            "evidence": evidence or None,
+            "severity_reason": f"fixed rating for '{etype or 'interesting finding'}' exposures",
         })
     return out
 
@@ -297,8 +348,10 @@ def parse_report(report: dict[str, Any], site_hint: str | None = None) -> dict[s
     # --- WordPress core ---------------------------------------------------- #
     version = report.get("version") or {}
     wp_number = version.get("number")
+    core_ev = component_evidence({"version": version}) if version else None
     findings += _findings_from_vulns(
-        site, "core", "WordPress core", wp_number, version.get("vulnerabilities", [])
+        site, "core", "WordPress core", wp_number, version.get("vulnerabilities", []),
+        evidence=core_ev,
     )
     if version.get("status") == "insecure" and not version.get("vulnerabilities"):
         findings.append({
@@ -315,21 +368,24 @@ def parse_report(report: dict[str, Any], site_hint: str | None = None) -> dict[s
         tname = theme.get("slug") or theme.get("style_name") or "theme"
         tver = (theme.get("version") or {}).get("number")
         findings += _findings_from_vulns(site, "theme", tname, tver,
-                                         theme.get("vulnerabilities", []))
+                                         theme.get("vulnerabilities", []),
+                                         evidence=component_evidence(theme))
         _maybe_outdated(findings, site, "theme", tname, tver, theme)
 
     # --- Additional themes ------------------------------------------------- #
     for slug, t in (report.get("themes") or {}).items():
         tver = (t.get("version") or {}).get("number")
         findings += _findings_from_vulns(site, "theme", slug, tver,
-                                         t.get("vulnerabilities", []))
+                                         t.get("vulnerabilities", []),
+                                         evidence=component_evidence(t))
         _maybe_outdated(findings, site, "theme", slug, tver, t)
 
     # --- Plugins ----------------------------------------------------------- #
     for slug, p in (report.get("plugins") or {}).items():
         pver = (p.get("version") or {}).get("number")
         findings += _findings_from_vulns(site, "plugin", slug, pver,
-                                         p.get("vulnerabilities", []))
+                                         p.get("vulnerabilities", []),
+                                         evidence=component_evidence(p))
         _maybe_outdated(findings, site, "plugin", slug, pver, p)
 
     # --- Interesting findings (exposures) ---------------------------------- #
@@ -341,13 +397,16 @@ def parse_report(report: dict[str, Any], site_hint: str | None = None) -> dict[s
         ("db_exports", "config", "critical"),
     ]:
         data = report.get(bucket) or {}
-        for url in (data.keys() if isinstance(data, dict) else []):
+        for url, meta in (data.items() if isinstance(data, dict) else []):
             findings.append({
                 "site": site, "finding_kind": "exposure", "component_type": ctype,
                 "component_name": bucket, "component_version": None,
                 "title": f"Exposed {bucket.replace('_', ' ')}: {url}",
                 "severity": sev, "cvss": None, "fixed_in": None,
                 "cves": [], "references": [url],
+                "evidence": {"url": url,
+                             "found_by": (meta or {}).get("found_by") if isinstance(meta, dict) else None},
+                "severity_reason": f"fixed rating for exposed {bucket.replace('_', ' ')}",
             })
 
     # --- Enumerated users (weak-but-useful signal) ------------------------- #
@@ -380,6 +439,8 @@ def _maybe_outdated(findings, site, ctype, name, version, comp):
                      + (f" (latest {latest})" if latest else ""),
             "severity": "low", "cvss": None, "fixed_in": latest,
             "cves": [], "references": [],
+            "evidence": component_evidence(comp),
+            "severity_reason": "outdated component with no known vulnerability",
         })
 
 

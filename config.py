@@ -27,6 +27,10 @@ without code changes.
   AUDIT_LOG          file that records who started/stopped what (default: audit.log)
   WPSCAN_THROTTLE    ms to wait between WPScan requests          (default: 0)
   WPSCAN_MAX_THREADS WPScan --max-threads (gentler on targets)   (default: wpscan default)
+  ENRICHMENT         fetch CVSS/EPSS/KEV for CVEs (NVD, FIRST,  (default: true)
+                     CISA; never touches the targets)
+  NVD_API_KEY        optional NVD key: 50 req/30s instead of 5  (default: none)
+  ENRICH_TTL_DAYS    re-fetch CVE data after this many days      (default: 7)
 """
 
 import os
@@ -63,4 +67,8 @@ CONFIG = {
     "AUDIT_LOG":        os.environ.get("AUDIT_LOG", "audit.log"),
     "WPSCAN_THROTTLE":  _int("WPSCAN_THROTTLE", 0),
     "WPSCAN_MAX_THREADS": _int("WPSCAN_MAX_THREADS", 0),
+    "ENRICHMENT":       os.environ.get("ENRICHMENT", "true"),
+    "NVD_API_KEY":      os.environ.get("NVD_API_KEY") or None,
+    "ENRICH_TTL_DAYS":  _int("ENRICH_TTL_DAYS", 7),
+    "ENRICH_MAX_PER_RUN": _int("ENRICH_MAX_PER_RUN", 150),
 }

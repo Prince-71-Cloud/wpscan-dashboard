@@ -35,7 +35,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from parser import EXPLOIT_REF_KINDS, classify_severity, reference_url
+from parser import EXPLOIT_REF_KINDS, classify_severity_ex, reference_url
 
 # Section headers that change how following component blocks are interpreted.
 _SECTION_RE = re.compile(r"^\[i\]\s+(.*?)\s+Identified", re.IGNORECASE)
@@ -46,7 +46,9 @@ _ENUM_RE = re.compile(r"^\[\+\]\s+Enumerating\s+(.*)", re.IGNORECASE)
 _COUNT_RE = re.compile(r"^\[i\]\s+(\d+\s+.*Identified|No\s+.*Found)", re.IGNORECASE)
 _REMAINING_RE = re.compile(r"Requests Remaining:\s*(\d+)", re.IGNORECASE)
 _COMPONENT_RE = re.compile(r"^\[\+\]\s+(.+?)\s*$")
-_VERSION_RE = re.compile(r"Version:\s*([0-9][^\s(]*)")
+_VERSION_RE = re.compile(r"Version:\s*([0-9][^\s(]*)(?:\s*\((\d+)% confidence\))?")
+_FOUND_BY_RE = re.compile(r"^(Found By|Confirmed By):\s*(.+)$")
+_LOCATION_RE = re.compile(r"^Location:\s*(\S+)")
 _WP_VERSION_RE = re.compile(r"WordPress version\s+([0-9][^\s]*)\s+identified", re.I)
 _IP_RE = re.compile(r"\[(\d{1,3}(?:\.\d{1,3}){3})\]")
 _TITLE_RE = re.compile(r"\[!\]\s*Title:\s*(.+?)\s*$")
@@ -106,10 +108,12 @@ def _finding(site: str, title: str, ctype: str, cname: str,
              version: str | None, fixed_in: str | None,
              cves: list[str], refs: list[str],
              severity: str | None = None,
-             kind: str = "vulnerability") -> dict[str, Any]:
-    sev, cvss = classify_severity(title)
+             kind: str = "vulnerability",
+             evidence: dict[str, Any] | None = None) -> dict[str, Any]:
+    sev, cvss, reason = classify_severity_ex(title)
     if severity is not None:
         sev = severity
+        reason = f"fixed rating for this {kind} class"
     severity = sev
     return {
         "site": site.rstrip("/"),
@@ -123,6 +127,8 @@ def _finding(site: str, title: str, ctype: str, cname: str,
         "fixed_in": fixed_in,
         "cves": cves,
         "references": refs,
+        "evidence": evidence or None,
+        "severity_reason": reason,
     }
 
 
@@ -170,6 +176,7 @@ class StreamingParser:
         self._cur_vulns:   list[dict[str, Any]] = []
         self._cur_vuln:    dict[str, Any] | None = None
         self._cur_outdated = False
+        self._cur_evidence: dict[str, Any] = {}
         self.requests_remaining: int | None = None
 
     def _emit(self, f: dict[str, Any]) -> None:
@@ -180,24 +187,29 @@ class StreamingParser:
     def _flush(self) -> None:
         ctype = self._section_type
         if self._cur_name and ctype in ("plugin", "theme", "core"):
+            evidence = dict(self._cur_evidence) or None
             if self._cur_vulns:
                 for v in self._cur_vulns:
                     self._emit(_finding(
                         self.site, v["title"], ctype, self._cur_name,
                         self._cur_version, v.get("fixed_in"),
                         v.get("cves", []),
-                        v.get("refs", []) + v.get("exploits", [])))
+                        v.get("refs", []) + v.get("exploits", []),
+                        evidence=evidence))
             elif self._cur_outdated:
-                self._emit(_finding(
+                f = _finding(
                     self.site,
                     f"{self._cur_name} {self._cur_version or ''} is outdated".strip(),
                     ctype, self._cur_name, self._cur_version,
-                    None, [], [], severity="low"))
+                    None, [], [], severity="low", evidence=evidence)
+                f["severity_reason"] = "outdated component with no known vulnerability"
+                self._emit(f)
         self._cur_name    = None
         self._cur_version = None
         self._cur_vulns   = []
         self._cur_vuln    = None
         self._cur_outdated = False
+        self._cur_evidence = {}
 
     def feed(self, raw: str) -> None:
         """Process one raw output line."""
@@ -269,7 +281,8 @@ class StreamingParser:
                 self._emit(_finding(
                     self.site, f"Exposed {bucket.replace('_', ' ')}: {url}",
                     "config", bucket, None, None, [], [url],
-                    severity=sev, kind="exposure"))
+                    severity=sev, kind="exposure",
+                    evidence={"url": url, "found_by": "Direct Access (Aggressive Detection)"}))
                 return
 
         # End-of-section sentinels
@@ -303,7 +316,8 @@ class StreamingParser:
                     self._emit(_finding(
                         self.site, f"{label}: {name}", "exposure",
                         name.split(":")[0], None, None, [],
-                        [url_ref.group(1)] if url_ref else [], severity=sev))
+                        [url_ref.group(1)] if url_ref else [], severity=sev,
+                        evidence={"url": url_ref.group(1)} if url_ref else None))
                 return
             if self._section_type in ("plugin", "theme"):
                 self._flush()
@@ -318,6 +332,20 @@ class StreamingParser:
         vm = _VERSION_RE.search(body)
         if vm and self._cur_name and self._cur_version is None:
             self._cur_version = vm.group(1)
+            if vm.group(2):
+                self._cur_evidence["version_confidence"] = f"{vm.group(2)}%"
+        if self._cur_name and self._cur_vuln is None:
+            lm = _LOCATION_RE.match(body)
+            if lm:
+                self._cur_evidence["location"] = lm.group(1)
+            fm0 = _FOUND_BY_RE.match(body)
+            if fm0:
+                key = "found_by" if fm0.group(1) == "Found By" else "confirmed_by"
+                # the first Found By is the component's, a later one (after
+                # Version:) belongs to the version detection
+                if key == "found_by" and "found_by" in self._cur_evidence:
+                    key = "version_found_by"
+                self._cur_evidence.setdefault(key, fm0.group(2).strip())
 
         if ("out of date" in body.lower()
                 or "the latest version is" in body.lower()):

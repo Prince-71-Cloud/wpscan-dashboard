@@ -102,9 +102,17 @@ _SENSITIVE_PATHS: list[tuple[str, str, str, Callable[[bytes], bool]]] = [
 _LISTING_DIRS = ["/wp-content/uploads/", "/wp-includes/", "/wp-content/plugins/"]
 
 
+def _sample(body: bytes, n: int = 160) -> str:
+    """First printable bytes of a body, one line, for evidence."""
+    txt = body[:n * 2].decode("utf-8", "replace")
+    return " ".join(txt.split())[:n]
+
+
 def _finding(site: str, title: str, severity: str, ctype: str = "web",
-             cname: str = "", references: list[str] | None = None) -> dict[str, Any]:
-    """Build a finding record matching parser.py's shape."""
+             cname: str = "", references: list[str] | None = None,
+             evidence: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Build a finding record matching parser.py's shape. `evidence` records
+    the request and what was observed so a developer can reproduce it."""
     return {
         "site": site.rstrip("/"),
         "finding_kind": "hygiene",
@@ -117,6 +125,8 @@ def _finding(site: str, title: str, severity: str, ctype: str = "web",
         "fixed_in": None,
         "cves": [],
         "references": references or [],
+        "evidence": {k: v for k, v in (evidence or {}).items() if v not in (None, "", [])} or None,
+        "severity_reason": "fixed rating for this hygiene check",
     }
 
 
@@ -196,14 +206,16 @@ def run_passive_checks(
     home = request("/", follow=True)
     if home:
         status, headers, _, _ = home
+        home_ev = {"request": f"GET {base}/", "status": status}
         for key, (sev, label) in _SECURITY_HEADERS.items():
             if key not in headers:
                 findings.append(_finding(
                     base, f"Missing security header: {label}", sev,
-                    ctype="headers", cname="response headers"))
+                    ctype="headers", cname="response headers",
+                    evidence={**home_ev, "observed": f"no {key} header in response"}))
         hsts = headers.get("strict-transport-security")
         if hsts:
-            findings.extend(_hsts_findings(base, hsts))
+            findings.extend(_hsts_findings(base, hsts, home_ev))
         acao = headers.get("access-control-allow-origin")
         if acao == "*":
             acac = (headers.get("access-control-allow-credentials", "")
@@ -212,34 +224,44 @@ def run_passive_checks(
                 base,
                 "Permissive CORS: Access-Control-Allow-Origin is '*'"
                 + (" with credentials allowed" if acac else ""),
-                "medium" if acac else "low", ctype="cors", cname="CORS"))
+                "medium" if acac else "low", ctype="cors", cname="CORS",
+                evidence={**home_ev, "observed": "Access-Control-Allow-Origin: *"
+                          + ("; Access-Control-Allow-Credentials: true" if acac else "")}))
         server = headers.get("server")
         if server and re.search(r"\d", server):
             findings.append(_finding(
                 base, f"Server software version disclosed via Server: {server}",
-                "info", ctype="disclosure", cname="headers"))
+                "info", ctype="disclosure", cname="headers",
+                evidence={**home_ev, "observed": f"Server: {server}"}))
         powered = headers.get("x-powered-by")
         if powered:
             findings.append(_finding(
                 base, f"Server technology disclosed via X-Powered-By: {powered}",
-                "info", ctype="disclosure", cname="headers"))
+                "info", ctype="disclosure", cname="headers",
+                evidence={**home_ev, "observed": f"X-Powered-By: {powered}"}))
 
     # --- 2. TLS / HTTPS posture ---------------------------------------------
     if parsed.scheme == "http":
         findings.append(_finding(
             base, "Site served over HTTP; traffic is unencrypted", "medium",
-            ctype="tls", cname="transport"))
+            ctype="tls", cname="transport",
+            evidence={"observed": f"target scheme is http:// ({base})"}))
     elif parsed.scheme == "https":
         tls = _tls_summary(parsed.hostname, parsed.port or 443, timeout)
-        findings.extend(_finding(base, t, sev, ctype="tls", cname="transport")
-                        for sev, t in tls)
+        findings.extend(_finding(base, t, sev, ctype="tls", cname="transport",
+                                 evidence={"request": f"TLS handshake {parsed.hostname}:"
+                                                      f"{parsed.port or 443}",
+                                           "observed": detail})
+                        for sev, t, detail in tls)
         # Is the plain-HTTP origin still serving content instead of redirecting?
         plain = request(f"http://{parsed.netloc}/")
         if plain and plain[0] == 200:
             findings.append(_finding(
                 base, "Plain HTTP is served without redirecting to HTTPS",
                 "low", ctype="tls", cname="transport",
-                references=[f"http://{parsed.netloc}/"]))
+                references=[f"http://{parsed.netloc}/"],
+                evidence={"request": f"GET http://{parsed.netloc}/", "status": 200,
+                          "observed": "200 with content; expected 301 to https://"}))
 
     # --- 3. Sensitive / commonly-exposed files ------------------------------
     for path, sev, why, looks_right in _SENSITIVE_PATHS:
@@ -250,7 +272,10 @@ def run_passive_checks(
         if status == 200 and body and looks_right(body):
             findings.append(_finding(
                 base, f"{why}: {path}", sev, ctype="exposure", cname=path,
-                references=[base + path]))
+                references=[base + path],
+                evidence={"request": f"GET {base}{path}", "status": status,
+                          "content_type": headers.get("content-type"),
+                          "sample": _sample(body)}))
 
     # --- 4. Directory listing -----------------------------------------------
     for d in _LISTING_DIRS:
@@ -261,7 +286,9 @@ def run_passive_checks(
         if status == 200 and (b"Index of /" in body or b"<title>Index of" in body):
             findings.append(_finding(
                 base, f"Directory listing enabled: {d}", "medium",
-                ctype="exposure", cname=d, references=[base + d]))
+                ctype="exposure", cname=d, references=[base + d],
+                evidence={"request": f"GET {base}{d}", "status": status,
+                          "sample": _sample(body)}))
 
     # --- 5. REST API user enumeration + CORS reflection ---------------------
     for path in ("/wp-json/wp/v2/users",
@@ -276,7 +303,9 @@ def run_passive_checks(
             findings.append(_finding(
                 base, f"User enumeration via REST API: {path}", "low",
                 ctype="enumeration", cname="wp-json",
-                references=[base + path]))
+                references=[base + path],
+                evidence={"request": f"GET {base}{path}", "status": status,
+                          "sample": _sample(body)}))
             break  # one hit is enough; the endpoint is exposed
 
     # Does the REST API echo an arbitrary Origin? (The homepage check above
@@ -292,7 +321,11 @@ def run_passive_checks(
                 "REST API reflects arbitrary Origin in Access-Control-Allow-Origin"
                 + (" with credentials allowed" if acac else ""),
                 "high" if acac else "medium", ctype="cors", cname="CORS",
-                references=[base + "/wp-json/"]))
+                references=[base + "/wp-json/"],
+                evidence={"request": f"GET {base}/wp-json/ with Origin: {_CORS_PROBE_ORIGIN}",
+                          "status": status,
+                          "observed": f"Access-Control-Allow-Origin: {acao}"
+                          + ("; Access-Control-Allow-Credentials: true" if acac else "")}))
 
     # --- 6. Login page reachable + cookie flags -----------------------------
     r = request("/wp-login.php")
@@ -300,26 +333,29 @@ def run_passive_checks(
         findings.append(_finding(
             base, "Admin login page reachable: /wp-login.php (no IP/WAF gating)",
             "info", ctype="exposure", cname="/wp-login.php",
-            references=[base + "/wp-login.php"]))
+            references=[base + "/wp-login.php"],
+            evidence={"request": f"GET {base}/wp-login.php", "status": 200,
+                      "observed": "login form served to an unauthenticated client"}))
     if r:
         findings.extend(_cookie_findings(base, r[3], https=parsed.scheme == "https"))
 
     return findings
 
 
-def _hsts_findings(base: str, value: str) -> list[dict[str, Any]]:
+def _hsts_findings(base: str, value: str, ev: dict[str, Any]) -> list[dict[str, Any]]:
     out = []
     low = value.lower()
     m = re.search(r"max-age\s*=\s*(\d+)", low)
     age = int(m.group(1)) if m else 0
+    evidence = {**ev, "observed": f"Strict-Transport-Security: {value[:120]}"}
     if age < _HSTS_MIN_AGE:
         out.append(_finding(
             base, f"HSTS max-age is too short ({age}s; recommended ≥ {_HSTS_MIN_AGE}s)",
-            "low", ctype="headers", cname="response headers"))
+            "low", ctype="headers", cname="response headers", evidence=evidence))
     if "includesubdomains" not in low:
         out.append(_finding(
             base, "HSTS lacks includeSubDomains", "info",
-            ctype="headers", cname="response headers"))
+            ctype="headers", cname="response headers", evidence=evidence))
     return out
 
 
@@ -344,16 +380,18 @@ def _cookie_findings(base: str, set_cookies: list[str], https: bool) -> list[dic
                 base, f"Cookie(s) set without {flag} flag: {', '.join(sorted(set(names))[:5])}",
                 "low" if flag != "SameSite" else "info",
                 ctype="headers", cname="cookies",
-                references=[base + "/wp-login.php"]))
+                references=[base + "/wp-login.php"],
+                evidence={"request": f"GET {base}/wp-login.php",
+                          "observed": "; ".join(c[:120] for c in set_cookies[:3])}))
     return out
 
 
-def _tls_summary(host: str | None, port: int, timeout: int) -> list[tuple[str, str]]:
+def _tls_summary(host: str | None, port: int, timeout: int) -> list[tuple[str, str, str]]:
     """TLS posture: certificate validity and expiry, and whether the server
     still accepts legacy protocol versions. The default client context refuses
     TLS 1.0/1.1 itself, so a plain handshake can never observe them — each
     legacy version is probed with a context pinned to that version."""
-    out: list[tuple[str, str]] = []
+    out: list[tuple[str, str, str]] = []
     if not host:
         return out
     try:
@@ -368,14 +406,17 @@ def _tls_summary(host: str | None, port: int, timeout: int) -> list[tuple[str, s
                         days = int(secs // 86400)
                         if days < 14:
                             out.append(("medium", f"TLS certificate expires in "
-                                                  f"{days} day(s) ({not_after})"))
+                                                  f"{days} day(s) ({not_after})",
+                                        f"notAfter={not_after}"))
                         elif days < 30:
                             out.append(("low", f"TLS certificate expires in "
-                                               f"{days} day(s) ({not_after})"))
+                                               f"{days} day(s) ({not_after})",
+                                        f"notAfter={not_after}"))
                     except ValueError:
                         pass
     except ssl.SSLCertVerificationError as e:
-        out.append(("medium", f"TLS certificate problem: {e.verify_message}"))
+        out.append(("medium", f"TLS certificate problem: {e.verify_message}",
+                    f"verify error: {e.verify_message}"))
     except (ssl.SSLError, socket.timeout, OSError):
         # Unreachable/handshake failure isn't itself a finding here.
         return out
@@ -395,7 +436,9 @@ def _tls_summary(host: str | None, port: int, timeout: int) -> list[tuple[str, s
             with socket.create_connection((host, port), timeout=timeout) as sock:
                 with legacy.wrap_socket(sock, server_hostname=host) as ss:
                     if ss.version():
-                        out.append(("medium", f"Legacy TLS protocol accepted: {name}"))
+                        out.append(("medium", f"Legacy TLS protocol accepted: {name}",
+                                    f"handshake succeeded with {ss.version()} "
+                                    f"cipher {ss.cipher()[0] if ss.cipher() else '?'}"))
         except (ssl.SSLError, ValueError, socket.timeout, OSError):
             pass  # refused (or unsupported by local OpenSSL) — that's the good case
     return out

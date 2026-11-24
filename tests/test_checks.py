@@ -83,10 +83,18 @@ class PassiveChecks(unittest.TestCase):
     def test_finding_shape(self):
         keys = {"site", "finding_kind", "component_type", "component_name",
                 "component_version", "title", "severity", "cvss", "fixed_in",
-                "cves", "references"}
+                "cves", "references", "evidence", "severity_reason"}
         for f in self.findings:
             self.assertEqual(set(f), keys)
             self.assertIn(f["severity"], ("critical", "high", "medium", "low", "info"))
+            if f["evidence"] is not None:
+                self.assertIsInstance(f["evidence"], dict)
+
+    def test_evidence_is_reproducible(self):
+        env = next(f for f in self.findings if "/.env" in f["title"])
+        self.assertEqual(env["evidence"]["status"], 200)
+        self.assertTrue(env["evidence"]["request"].startswith("GET http://127.0.0.1"))
+        self.assertIn("APP_KEY", env["evidence"]["sample"])
 
 
 if __name__ == "__main__":

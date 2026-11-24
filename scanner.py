@@ -1022,9 +1022,10 @@ class ScanManager:
     and raw verbose scan output goes to `self.log` for the live console.
     """
 
-    def __init__(self, db: Database, config: dict[str, Any]):
+    def __init__(self, db: Database, config: dict[str, Any], enricher=None):
         self.db = db
         self.config = config
+        self.enricher = enricher      # enrich.Enricher, optional
         self._lock = threading.Lock()
         self._running = False
         self._paused = False          # batch-level pause flag
@@ -1187,11 +1188,16 @@ class ScanManager:
             partial = sum(1 for v in st_of.values() if v == "partial")
             failed = len(st_of) - ok - partial
             total_findings = len(self.db.all_findings())
+            new_total = sum(int(statuses.get(s, {}).get("new_count") or 0)
+                            for s in st_of)
+            fixed_total = sum(int(statuses.get(s, {}).get("fixed_count") or 0)
+                              for s in st_of)
             msg = (f"Scan complete — {ok}/{len(sites)} target(s) succeeded"
-                   + (f", {partial} partial (timed out)" if partial else "")
+                   + (f", {partial} partial" if partial else "")
                    + (f", {failed} failed" if failed else "")
                    + (f", {len(skipped)} skipped (cancelled)" if skipped else "")
-                   + f". {total_findings} finding(s) in {elapsed}s.")
+                   + f". {total_findings} finding(s), {new_total} new, "
+                   + f"{fixed_total} fixed, in {elapsed}s.")
             self.events.emit("scan_complete", msg,
                              level="warn" if (failed or partial) else "success")
 
@@ -1281,7 +1287,8 @@ class ScanManager:
                 effective = parsed.get("site") or target_url
                 extra_findings = self._hygiene_findings(effective)
                 all_findings = wp_findings + extra_findings
-                self.db.replace_findings(site, scan_id, all_findings)
+                diff = self.db.replace_findings(site, scan_id, all_findings)
+                self._after_save(site)
 
                 # WPScan does not abort when the key's daily quota runs out
                 # mid-scan: the API client silently returns no data for every
@@ -1303,11 +1310,14 @@ class ScanManager:
                     wp_version=parsed.get("wp_version"),
                     target_ip=parsed.get("target_ip"),
                     error=note,
+                    new_count=len(diff["new"]) + len(diff["regressed"]),
+                    fixed_count=len(diff["fixed"]),
                 )
                 n = len(all_findings)
                 extra_note = (f" ({len(wp_findings)} WPScan + "
                               f"{len(extra_findings)} hygiene)"
                               if extra_findings else "")
+                extra_note += _diff_note(diff)
                 redirect_note = (f" via {effective}" if effective.rstrip("/")
                                  != site.rstrip("/") else "")
                 self.events.emit(
@@ -1359,18 +1369,22 @@ class ScanManager:
                 # still worth running to make the partial result more complete.
                 extra_findings = self._hygiene_findings(partial["site"] or target_url)
                 partial["findings"] = partial["findings"] + extra_findings
-                self.db.replace_findings(site, scan_id, partial["findings"])
+                diff = self.db.replace_findings(site, scan_id, partial["findings"])
+                self._after_save(site)
                 self.db.update_scan(
                     scan_id, status="partial", finished_at=time.time(),
                     wp_version=partial.get("wp_version"),
                     target_ip=partial.get("target_ip"),
                     error=str(exc),
+                    new_count=len(diff["new"]) + len(diff["regressed"]),
+                    fixed_count=len(diff["fixed"]),
                 )
                 n = len(partial["findings"])
                 self.log.append(site, f"!! PARTIAL: {n} finding(s) saved before timeout")
                 self.events.emit(
                     "target_done",
-                    f"[{index}/{total}] {site} partial — {n} finding(s) before timeout.",
+                    f"[{index}/{total}] {site} partial — {n} finding(s) before "
+                    f"timeout{_diff_note(diff)}.",
                     level="warn",
                 )
                 self._mark_done()
@@ -1433,6 +1447,17 @@ class ScanManager:
                          level="error")
         self._mark_done()
 
+    def _after_save(self, site: str) -> None:
+        """Grade the just-saved findings from the CVE cache right away, then
+        fetch anything missing in the background. Best-effort."""
+        if self.enricher is None:
+            return
+        try:
+            self.enricher.apply(site)
+            self.enricher.schedule()
+        except Exception:  # noqa: BLE001 — enrichment never fails a scan
+            pass
+
     def _hygiene_findings(self, site: str) -> list[dict[str, Any]]:
         """Passive web-hygiene checks (headers, CORS, TLS, exposed files,
         directory listing, REST user enumeration) that WPScan doesn't cover.
@@ -1451,7 +1476,19 @@ class ScanManager:
             self._done += 1
 
 
-def ingest_directory(db: Database, directory: str) -> int:
+def _diff_note(diff: dict[str, Any]) -> str:
+    """' — 3 new, 1 regressed, 2 fixed' for toasts; empty when nothing changed."""
+    parts = []
+    if diff.get("new"):
+        parts.append(f"{len(diff['new'])} new")
+    if diff.get("regressed"):
+        parts.append(f"{len(diff['regressed'])} regressed")
+    if diff.get("fixed"):
+        parts.append(f"{len(diff['fixed'])} fixed")
+    return f" — {', '.join(parts)}" if parts else ""
+
+
+def ingest_directory(db: Database, directory: str, enricher=None) -> int:
     """Load every *.json WPScan report in a directory. Returns count ingested."""
     import time
     count = 0
@@ -1465,16 +1502,28 @@ def ingest_directory(db: Database, directory: str) -> int:
             report = ingest_file(path)
             parsed = report_parser.parse_report(report, site_hint=name)
             scan_id = db.create_scan(parsed["site"], status="running", source="ingest")
-            db.replace_findings(parsed["site"], scan_id, parsed["findings"])
+            diff = db.replace_findings(parsed["site"], scan_id, parsed["findings"])
             db.update_scan(scan_id, status="success", finished_at=time.time(),
                            wp_version=parsed.get("wp_version"),
-                           target_ip=parsed.get("target_ip"))
+                           target_ip=parsed.get("target_ip"),
+                           new_count=len(diff["new"]) + len(diff["regressed"]),
+                           fixed_count=len(diff["fixed"]))
+            if enricher is not None:
+                try:
+                    enricher.apply(parsed["site"])
+                except Exception:  # noqa: BLE001 — optional
+                    pass
             count += 1
         except Exception as exc:  # noqa: BLE001 — one bad file mustn't abort the ingest
             msg = str(exc) if isinstance(exc, WPScanError) else (
                 f"Could not ingest {name}: {type(exc).__name__}: {exc}")
             sid = db.create_scan(name, status="error", source="ingest")
             db.update_scan(sid, error=msg, finished_at=time.time())
+    if count and enricher is not None:
+        try:
+            enricher.schedule()
+        except Exception:  # noqa: BLE001 — optional
+            pass
     return count
 
 

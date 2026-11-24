@@ -50,6 +50,14 @@ class Layout42(unittest.TestCase):
         self.assertIn("https://www.rapid7.com/db/modules/exploit/multi/http/wp_cf7_upload/",
                       f["references"])
 
+    def test_evidence_and_reason(self):
+        f = self.f["Astra < 4.1.6 - Reflected Cross-Site Scripting"]
+        self.assertEqual(f["evidence"]["version_confidence"], "80%")
+        self.assertEqual(f["evidence"]["location"], "https://example.test/wp-content/themes/astra/")
+        self.assertIn("keyword", f["severity_reason"])
+        cb = self.f["Exposed config backups: https://example.test/wp-config.php.bak"]
+        self.assertEqual(cb["evidence"]["url"], "https://example.test/wp-config.php.bak")
+
     def test_users_and_interesting(self):
         self.assertIn("User enumerated: admin", self.f)
         self.assertTrue(any(t.startswith("XML-RPC enabled") for t in self.f))

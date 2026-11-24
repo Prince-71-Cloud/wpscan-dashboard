@@ -20,6 +20,8 @@ const state = {
   logTimer: null,
   lastLogId: 0,
   autoScroll: true,     // stick to bottom unless the user scrolls up
+  openDetails: new Set(), // finding ids whose detail row is expanded
+  fixedOpen: false,
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -83,7 +85,9 @@ async function load() {
   renderTargets(state.sites);
   renderSiteFilter(state.sites);
   renderScanState(data.scanning, data.progress);
+  renderEnrichState(data.enrichment);
   render();
+  if (state.fixedOpen) loadFixed();
 
   // Always keep polling, but adapt the rate: fast while a batch runs so
   // progress toasts land near real time, slow when idle so a scan started
@@ -103,6 +107,7 @@ function schedulePoll(delay) {
  * UI as events (target changes, API key rotation, batch completion) and shown
  * here as stacked, auto-dismissing toasts. */
 const TOAST_ICONS = {
+  enrich_done: "◎",
   scan_start: "▶",
   target_start: "◆",
   target_done: "✓",
@@ -309,6 +314,17 @@ function renderTargets(sites) {
       node.appendChild(el("span", "badge-queued", "queued"));
     }
 
+    // What the latest scan changed: "+2 new · 1 fixed"
+    const nNew = Number(s.new_count || 0), nFixed = Number(s.fixed_count || 0);
+    if ((rawStatus === "success" || rawStatus === "partial") && (nNew || nFixed)) {
+      const parts = [];
+      if (nNew) parts.push(`+${nNew} new`);
+      if (nFixed) parts.push(`${nFixed} fixed`);
+      const d = el("span", "target-diff", parts.join(" · "));
+      if (nNew) d.classList.add("has-new");
+      node.appendChild(d);
+    }
+
     // Per-site controls
     const controls = el("span", "target-controls");
 
@@ -452,7 +468,8 @@ function currentView() {
     if (type && f.component_type !== type) return false;
     if (q) {
       const hay = [f.title, f.component_name, f.component_type,
-                   (f.cves || []).join(" ")].join(" ").toLowerCase();
+                   (f.cves || []).join(" "),
+                   f.remediation ? f.remediation.action : ""].join(" ").toLowerCase();
       if (!hay.includes(q)) return false;
     }
     return true;
@@ -484,24 +501,55 @@ function render() {
   empty.hidden = true;
 
   const frag = document.createDocumentFragment();
-  rows.forEach((f) => frag.appendChild(rowFor(f)));
+  rows.forEach((f) => {
+    frag.appendChild(rowFor(f));
+    if (state.openDetails.has(f.id)) frag.appendChild(detailRowFor(f));
+  });
   body.appendChild(frag);
 }
 
 function rowFor(f) {
-  const tr = el("tr");
+  const tr = el("tr", "frow");
+  tr.tabIndex = 0;
+  tr.title = "Click for fix, evidence and severity reasoning";
+  if (state.openDetails.has(f.id)) tr.classList.add("open");
+  const toggle = () => {
+    state.openDetails.has(f.id) ? state.openDetails.delete(f.id)
+                                : state.openDetails.add(f.id);
+    render();
+  };
+  tr.addEventListener("click", (ev) => { if (ev.target.tagName !== "A") toggle(); });
+  tr.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); toggle(); }
+  });
 
   // Severity
   const sev = el("td");
   const pill = el("span", `sev-pill ${f.severity}`, f.severity);
+  if (f.severity_reason) pill.title = f.severity_reason;
   sev.appendChild(pill);
   tr.appendChild(sev);
 
-  // Title + kind + cvss
+  // Title + badges + kind + cvss
   const title = el("td");
+  if (f.history_status === "new") title.appendChild(el("span", "badge badge-new", "new"));
+  if (f.history_status === "regressed") title.appendChild(el("span", "badge badge-regressed", "regressed"));
+  if (f.kev) {
+    const k = el("span", "badge badge-kev", "KEV");
+    k.title = "CISA Known Exploited Vulnerability — exploited in the wild";
+    title.appendChild(k);
+  }
   const t = el("span", "finding-title", f.title || "—");
   title.appendChild(t);
-  if (f.cvss != null) title.appendChild(el("span", "cvss", `CVSS ${f.cvss}`));
+  if (f.cvss != null) {
+    const c = el("span", "cvss", `CVSS ${f.cvss}${f.cvss_source === "nvd" ? " · NVD" : ""}`);
+    title.appendChild(c);
+  }
+  if (f.epss != null) {
+    const e = el("span", "epss", `EPSS ${Math.round(Number(f.epss) * 100)}%`);
+    e.title = "Probability of exploitation in the next 30 days (FIRST EPSS)";
+    title.appendChild(e);
+  }
   if (f.finding_kind && f.finding_kind !== "vulnerability")
     title.appendChild(document.createElement("br")),
       title.appendChild(el("span", "kind", f.finding_kind));
@@ -558,6 +606,125 @@ function rowFor(f) {
   tr.appendChild(ref);
 
   return tr;
+}
+
+/* ---------------------------- Detail row ---------------------------- */
+/* Everything a developer needs to act on one finding: why it got its
+ * severity, the concrete fix with snippets, the evidence that produced it,
+ * and when it was first seen. All text goes in via textContent. */
+function kv(label, value) {
+  const row = el("div", "kv");
+  row.appendChild(el("span", "kv-k", label));
+  row.appendChild(el("span", "kv-v", value));
+  return row;
+}
+
+function fmtDate(ts) {
+  if (!ts) return "—";
+  try { return new Date(Number(ts) * 1000).toLocaleString(); } catch { return "—"; }
+}
+
+function detailRowFor(f) {
+  const tr = el("tr", "frow-detail");
+  const td = el("td");
+  td.colSpan = 7;
+  const wrap = el("div", "detail");
+
+  // Why this severity
+  const why = el("section", "detail-block");
+  why.appendChild(el("h4", null, "Why this severity"));
+  why.appendChild(kv("Reason", f.severity_reason || "fixed rating for this finding type"));
+  if (f.cvss != null) why.appendChild(kv("CVSS", `${f.cvss} (${f.cvss_source === "nvd" ? "NVD" : "WPScan advisory"})`));
+  if (f.epss != null) why.appendChild(kv("EPSS", `${(Number(f.epss) * 100).toFixed(1)}% chance of exploitation within 30 days`));
+  if (f.kev) why.appendChild(kv("CISA KEV", "listed as exploited in the wild — treat as critical"));
+  if ((f.cves || []).length) why.appendChild(kv("CVE", f.cves.join(", ")));
+  wrap.appendChild(why);
+
+  // Fix
+  const rem = f.remediation;
+  if (rem) {
+    const fix = el("section", "detail-block");
+    fix.appendChild(el("h4", null, "How to fix"));
+    fix.appendChild(el("p", "fix-action", rem.action));
+    const ol = el("ol", "fix-steps");
+    (rem.steps || []).forEach((st) => ol.appendChild(el("li", null, st)));
+    fix.appendChild(ol);
+    Object.entries(rem.snippets || {}).forEach(([label, code]) => {
+      fix.appendChild(el("div", "snippet-label", label));
+      fix.appendChild(el("pre", "snippet", code));
+    });
+    (rem.references || []).filter((r) => /^https?:\/\//.test(r)).slice(0, 4).forEach((r) => {
+      const a = el("a", "reflink", r);
+      a.href = r; a.target = "_blank"; a.rel = "noopener noreferrer";
+      fix.appendChild(a);
+      fix.appendChild(document.createElement("br"));
+    });
+    wrap.appendChild(fix);
+  }
+
+  // Evidence
+  const ev = f.evidence || {};
+  const keys = Object.keys(ev);
+  if (keys.length) {
+    const evb = el("section", "detail-block");
+    evb.appendChild(el("h4", null, "Evidence"));
+    keys.forEach((k) => {
+      const v = ev[k];
+      evb.appendChild(kv(k.replace(/_/g, " "), Array.isArray(v) ? v.join(" | ") : String(v)));
+    });
+    wrap.appendChild(evb);
+  }
+
+  // History
+  const hist = el("section", "detail-block");
+  hist.appendChild(el("h4", null, "History"));
+  hist.appendChild(kv("Status", f.history_status || "—"));
+  hist.appendChild(kv("First seen", fmtDate(f.first_seen)));
+  hist.appendChild(kv("Last seen", fmtDate(f.last_seen)));
+  wrap.appendChild(hist);
+
+  td.appendChild(wrap);
+  tr.appendChild(td);
+  return tr;
+}
+
+/* --------------------------- Resolved panel ------------------------- */
+async function loadFixed() {
+  try {
+    const site = $("#filter-site").value;
+    const res = await fetch(`/api/history${site ? `?site=${encodeURIComponent(site)}` : ""}`);
+    const data = await res.json();
+    const list = $("#fixed-list");
+    list.innerHTML = "";
+    const rows = data.resolved || [];
+    $("#fixed-count").textContent = `${rows.length} resolved`;
+    if (!rows.length) list.appendChild(el("li", "fixed-empty", "Nothing resolved yet — findings appear here when a re-scan no longer reports them."));
+    rows.forEach((r) => {
+      const li = el("li", "fixed-item");
+      li.appendChild(el("span", `sev-pill ${r.severity || "info"}`, r.severity || "info"));
+      li.appendChild(el("span", "fixed-title", r.title || "—"));
+      li.appendChild(el("span", "fixed-meta",
+        `${host(r.site)} · ${r.component_type || ""} ${r.component_name || ""} · resolved ${fmtDate(r.resolved_at)}`));
+      list.appendChild(li);
+    });
+  } catch { /* transient */ }
+}
+
+function toggleFixed() {
+  state.fixedOpen = !state.fixedOpen;
+  $("#fixed-panel").hidden = !state.fixedOpen;
+  $("#btn-fixed").setAttribute("aria-pressed", String(state.fixedOpen));
+  if (state.fixedOpen) loadFixed();
+}
+
+function renderEnrichState(enr) {
+  const node = $("#enrich-state");
+  if (!node) return;
+  if (!enr || !enr.enabled || (!enr.running && !enr.pending)) { node.hidden = true; return; }
+  node.hidden = false;
+  node.textContent = enr.running
+    ? `◎ CVE data: fetching (${enr.pending} pending)`
+    : `◎ CVE data: ${enr.pending} pending`;
 }
 
 /* ------------------------------ Actions ----------------------------- */
@@ -686,6 +853,9 @@ $("#btn-export-pdf").addEventListener("click",
   () => download("/api/export.pdf", "PDF"));
 $("#btn-export-json").addEventListener("click",
   () => download("/api/export.json", "JSON"));
+
+$("#btn-fixed").addEventListener("click", toggleFixed);
+$("#filter-site").addEventListener("change", () => { if (state.fixedOpen) loadFixed(); });
 
 /* Batch controls */
 $("#btn-pause").addEventListener("click",  () => state.paused ? resumeBatch() : pauseBatch());
